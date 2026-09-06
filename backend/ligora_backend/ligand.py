@@ -387,11 +387,6 @@ class LigandResolver:
         if not cid_list:
             return None
 
-        # If the variant text matches a canonical Heme synonym, prefer the
-        # PubChem hemin entry when it appears in the result set. This preference
-        # is chosen for that specific query pattern and is not used to infer
-        # chemical identity for other residue names.
-# No hardcoded chemical synonym preferences.
         # Prefer the most specific CID available from the source response
         # using only the information that PubChem returned, not chemical intuition.
         return min(cid_list)

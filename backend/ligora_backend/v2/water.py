@@ -40,6 +40,7 @@ class WaterNetworkAnalyzer:
                 'water_count': 0,
                 'network': [],
                 'clusters': [],
+                'water_contacts': [],
                 'conservation': {},
             }
 
@@ -56,7 +57,7 @@ class WaterNetworkAnalyzer:
             'water_count': len(water_molecules),
             'network': network,
             'clusters': clusters,
-            'contacts': contacts,
+            'water_contacts': contacts,
             'conservation': self._analyze_conservation(water_molecules),
         }
 
@@ -76,7 +77,7 @@ class WaterNetworkAnalyzer:
 
         for chain in structure.chains:
             for residue in chain.residues:
-                if residue.name in ('HOH', 'WAT', 'SOL', 'TIP3', 'TIP4'):
+                if residue.name in ('HOH', 'WAT', 'SOL'):
                     atoms = residue.atoms
                     if len(atoms) >= 1:
                         water = {

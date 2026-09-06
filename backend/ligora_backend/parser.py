@@ -101,8 +101,8 @@ class StructureParser:
 
             if poly_info:
                 # This is a polymer - create chains
-                pdbx_types = poly_info.get("pdbx_strand_id", "")
-                for strand_id in pdbx_types.split(","):
+                strand_id_list = poly_info.get("pdbx_strand_id", "")
+                for strand_id in strand_id_list.split(","):
                     strand_id = strand_id.strip()
                     if strand_id:
                         chain = Chain(
@@ -250,13 +250,10 @@ class StructureParser:
                     # Find or create chain with this atom
                     pass
 
-        # Create ligand objects from the candidate groups.
-        # Names and atom groupings come from the structure file.
-        # Formula and molecular weight are not computed here from hardcoded
-        # element/weight tables. Those are derived chemical properties that come
-        # from data sources (CCD formula / formula_weight, PubChem, etc.) and are
-        # attached by the enrichment client. The parser only carries the identity
-        # it can read directly from the structure file.
+        # Create candidate non-polymer objects from the structure-file groups.
+        # Names and atom groupings come from the structure file. Formula,
+        # molecular weight, SMILES, and classification are not decided here from
+        # local heuristics; those are attached later by the enrichment client / CCD.
         for comp_id, atoms in entity_comp_atoms.items():
             if not atoms:
                 continue
@@ -277,12 +274,6 @@ class StructureParser:
 
         # Set chain list from dictionary
         structure.chains = list(chains.values())
-
-        # Add atom counts
-        for chain in structure.chains:
-            for residue in chain.residues:
-                for atom in residue.atoms:
-                    pass  # atoms already attached
 
         # Extract resolution from quality info
         quality = data.get("_pdbx_quality", {})
