@@ -18,16 +18,11 @@ const CHAIN_COLORS = [
 ];
 
 const RESIDUE_COLORS = {};
-// Hydrophobic residues
-['ALA', 'VAL', 'LEU', 'ILE', 'MET', 'PHE', 'TRP', 'PRO'].forEach((r, i) => RESIDUE_COLORS[r] = CHAIN_COLORS[i % CHAIN_COLORS.length]);
-// Polar residues
-['Ser', 'THR', 'CYS', 'TYR', 'ASN', 'GLN'].forEach((r, i) => RESIDUE_COLORS[r] = 0x4e79ba);
-// Charged residues
-['LYS', 'ARG', 'HIS'].forEach((r, i) => RESIDUE_COLORS[r] = 0x009e73);  // Basic
-['ASP', 'GLU'].forEach((r, i) => RESIDUE_COLORS[r] = 0xd55e00);  // Acidic
-// Special
-['GLY'] = 0x999999;
-['ALA'] = 0xe69f00;
+// The app does not decide residue chemistry from a hardcoded residue list.
+// Color assignment is a visualization preference only and must not be
+// interpreted as chemical classification. Residue color sets are optional
+// UI state; the authoritative residue identity comes from the structure
+// file and enrichment layer.
 
 export function createApp(options = {}) {
   const appContainer = document.createElement('div')
@@ -182,6 +177,13 @@ function createRightPanel() {
       <textarea class="notes-area" placeholder="Add notes about this analysis..." rows="4"></textarea>
     </div>
   `
+
+  // Bind panel update helpers to this panel instance
+  panel.querySelector('.ligand-card')._update = updateLigandCard
+  panel.querySelector('.contacts-table')._update = updateContactsPanel
+  panel.querySelector('.evidence-pane')._update = updateEvidencePanel
+  panel.querySelector('.jobs-pane')._update = updateJobsPanel
+
   return panel
 }
 
@@ -231,6 +233,9 @@ function createTopBar() {
       </button>
       <button class="btn btn-primary" id="btn-run-analysis">
         Run Analysis
+      </button>
+      <button class="btn btn-secondary" id="btn-get-status">
+        Refresh Status
       </button>
     </div>
   `
@@ -309,6 +314,17 @@ function implementControls(layout, scene, state, options) {
           if (result) {
             state.contacts = result.contacts || []
             updateContactsPanel(result)
+            if (result.ligand_resolved) {
+              state.selectedLigand = result.ligand_resolved
+              updateLigandCard(result.ligand_resolved)
+            } else if (result.ligand) {
+              state.selectedLigand = result.ligand
+              updateLigandCard(result.ligand)
+            }
+            if (result.evidence) {
+              state.evidence = result.evidence
+              updateEvidencePanel(result.evidence)
+            }
           }
         }
       } catch (error) {
@@ -327,6 +343,21 @@ function implementControls(layout, scene, state, options) {
       state.measureMode = !state.measureMode
       measureBtn.classList.toggle('active', state.measureMode)
       measureBtn.textContent = state.measureMode ? 'Measuring...' : 'Measure'
+    })
+  }
+
+  // Status refresh button
+  const statusSel = layout.querySelector('#btn-get-status')
+  if (statusSel) {
+    statusSel.addEventListener('click', async () => {
+      try {
+        if (options.onGetStatus) {
+          const status = await options.onGetStatus()
+          updateJobsPanel(status)
+        }
+      } catch (error) {
+        console.error('Status error:', error)
+      }
     })
   }
 }
@@ -365,12 +396,12 @@ function updateContactsPanel(result) {
   html += '</tr></thead><tbody>'
 
   result.contacts.slice(0, 50).forEach(c => {
-    const typeClass = c.contact_type.replace(/_/g, '-')
+    const typeClass = (c.contact_type || 'unknown').replace(/_/g, '-')
     html += `<tr class="contact-row">`
-    html += `<td><span class="contact-badge ${typeClass}">${c.contact_type}</span></td>`
-    html += `<td>${c.protein_residue_name}${c.protein_residue_id} (${c.protein_chain_id})</td>`
-    html += `<td>${c.ligand_residue_name}${c.ligand_residue_id}</td>`
-    html += `<td>${c.distance.toFixed(2)} Å</td>`
+    html += `<td><span class="contact-badge ${typeClass}">${escapeHtml(c.contact_type || 'unknown')}</span></td>`
+    html += `<td>${escapeHtml(c.protein_residue_name || '')}${escapeHtml(String(c.protein_residue_id || ''))} (${escapeHtml(c.protein_chain_id || '')})</td>`
+    html += `<td>${escapeHtml(c.ligand_residue_name || '')}${escapeHtml(String(c.ligand_residue_id || ''))}</td>`
+    html += `<td>${c.distance != null ? Number(c.distance).toFixed(2) : '—'} Å</td>`
     html += `</tr>`
   })
 
@@ -381,4 +412,147 @@ function updateContactsPanel(result) {
   }
 
   contactsSection.innerHTML = html
+}
+
+function escapeHtml(s) {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+}
+
+function updateLigandCard(ligand) {
+  const card = document.querySelector('.ligand-card')
+  if (!card) return
+
+  const hintClass =
+    ligand.classification_hint === 'solvent' ? 'solvent' :
+    ligand.classification_hint === 'ion' ? 'ion' :
+    ligand.classification_hint === 'small-molecule' ? 'small-molecule' :
+    ligand.classification_hint === 'cofactor' ? 'cofactor' :
+    'unknown'
+
+  card.innerHTML = `
+    <div class="ligand-header">
+      <span class="ligand-name">${escapeHtml(ligand.name || ligand.residue_name || 'Unknown')}</span>
+      <span class="ligand-badge ${hintClass}">${escapeHtml(ligand.classification_hint || 'unclassified')}</span>
+    </div>
+    <div class="ligand-properties">
+      <div class="ligand-property">
+        <div class="ligand-property-label">Formula</div>
+        <div class="ligand-property-value">${ligand.formula ? escapeHtml(ligand.formula) : '—'}</div>
+      </div>
+      <div class="ligand-property">
+        <div class="ligand-property-label">MW</div>
+        <div class="ligand-property-value">${ligand.molecular_weight != null ? Number(ligand.molecular_weight).toFixed(2) : '—'}</div>
+      </div>
+      <div class="ligand-property">
+        <div class="ligand-property-label">SMILES</div>
+        <div class="ligand-property-value">${ligand.smiles ? escapeHtml(ligand.smiles) : '—'}</div>
+      </div>
+      <div class="ligand-property">
+        <div class="ligand-property-label">InChI Key</div>
+        <div class="ligand-property-value">${ligand.inchi_key ? escapeHtml(ligand.inchi_key) : '—'}</div>
+      </div>
+      <div class="ligand-property">
+        <div class="ligand-property-label">IUPAC</div>
+        <div class="ligand-property-value">${ligand.iupac_name ? escapeHtml(ligand.iupac_name) : '—'}</div>
+      </div>
+      <div class="ligand-property">
+        <div class="ligand-property-label">PubChem CID</div>
+        <div class="ligand-property-value">${ligand.pubchem_cid ? String(ligand.pubchem_cid) : '—'}</div>
+      </div>
+      <div class="ligand-property">
+        <div class="ligand-property-label">ChEMBL ID</div>
+        <div class="ligand-property-value">${ligand.chembl_id ? escapeHtml(ligand.chembl_id) : '—'}</div>
+      </div>
+      <div class="ligand-property">
+        <div class="ligand-property-label">Resolution</div>
+        <div class="ligand-property-value">${escapeHtml(ligand.resolution_status || '—')}</div>
+      </div>
+    </div>
+  `
+}
+
+function updateEvidencePanel(evidence) {
+  const panel = document.querySelector('.evidence-pane')
+  if (!panel) return
+
+  if (!evidence || evidence.length === 0) {
+    panel.innerHTML = `
+      <div class="evidence-placeholder">
+        No enrichment evidence available
+      </div>
+    `
+    return
+  }
+
+  let html = ''
+  evidence.forEach(e => {
+    const val = typeof e.value === 'object' ? JSON.stringify(e.value, null, 2) : String(e.value)
+    html += `<div class="evidence-item">
+      <div class="evidence-source">${escapeHtml(e.source)}</div>
+      <div class="evidence-value">${escapeHtml(val)}</div>
+      ${e.url ? `<div class="evidence-url">${escapeHtml(e.url)}</div>` : ''}
+    </div>`
+  })
+  panel.innerHTML = html
+}
+
+function updateJobsPanel(statusOrResult) {
+  const pane = document.querySelector('.jobs-pane')
+  if (!pane) return
+
+  if (!statusOrResult) {
+    pane.innerHTML = `
+      <div class="jobs-placeholder">
+        No running jobs
+      </div>
+    `
+    return
+  }
+
+  const jobs = Array.isArray(statusOrResult.jobs) ? statusOrResult.jobs : []
+  const engines = statusOrResult.engines
+
+  let html = ''
+  if (engines && typeof engines === 'object') {
+    html += `<div class="jobs-section">
+      <div class="jobs-section-title">Engines</div>
+      <div class="jobs-list">`
+    for (const [name, info] of Object.entries(engines)) {
+      const available = info && info.available === true
+      html += `<div class="job-item">
+        <span class="job-status ${available ? 'completed' : 'failed'}"></span>
+        <span>${escapeHtml(name)}</span>
+        <span class="job-detail">${available ? 'available' : 'not available'}</span>
+      </div>`
+    }
+    html += `</div></div>`
+  }
+
+  if (jobs && jobs.length > 0) {
+    html += `<div class="jobs-section">
+      <div class="jobs-section-title">Jobs</div>
+      <div class="jobs-list">`
+    jobs.forEach(j => {
+      const statusClass = j.status || 'pending'
+      html += `<div class="job-item">
+        <span class="job-status ${statusClass}"></span>
+        <span>${escapeHtml(j.id || '')}</span>
+        <span class="job-detail">${escapeHtml(statusClass)}</span>
+      </div>`
+    })
+    html += `</div></div>`
+  }
+
+  if (!html) {
+    html = `<div class="jobs-placeholder">
+      No running jobs
+    </div>`
+  }
+
+  pane.innerHTML = html
 }

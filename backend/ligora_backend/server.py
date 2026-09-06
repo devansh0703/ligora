@@ -259,22 +259,17 @@ class BackendServer:
             session = self.workspace_manager.create_session()
             self._sessions[session.id] = session
             self._current_session_id = session.id
-        else:
-            session = self._sessions[session_id]
-            self._current_session_id = session_id
+            session_id = session.id
+            return self._handle_open_pdb_id(payload, session_id)
+        session = self._sessions[session_id]
+        self._current_session_id = session_id
 
-        # Fetch from RCSB
+        # Fetch from RCSB and persist it locally so the app is not purely
+        # live-dependent for the session workspace.
         structure = self.parser.fetch_from_rcsb(pdb_id, format='mmCIF')
         structure.id = pdb_id
         session.structure = structure
 
-        # Save to workspace
-        content = self.parser.parse_mmcif(
-            Path(f"/dev/null").read_text(),  # dummy
-            source_id=pdb_id,
-            source='local'
-        )
-        # Use the parser to get content string
         try:
             import requests
             response = requests.get(
@@ -286,14 +281,16 @@ class BackendServer:
             workspace_path = session.get_workspace() / f'{pdb_id}.cif'
             workspace_path.write_text(content)
 
-            # Re-parse from the saved content
+            # Re-parse from the saved content so the workspace has an
+            # authoritative local copy.
             structure = self.parser.parse_mmcif(
                 content, source_id=pdb_id, source='rcsb'
             )
+            session.structure = structure
         except Exception as e:
             raise RuntimeError(f"Failed to download structure: {e}")
 
-        # Resolve ligands
+        # Resolve ligands against the live sources
         for ligand in structure.ligands:
             self.ligand_resolver.resolve_ligand(ligand, pdb_id)
 
@@ -329,8 +326,10 @@ class BackendServer:
 
         session.selected_ligand_id = ligand_id
 
+        enriched_ligand = self.ligand_resolver.resolve_ligand(ligand, session.structure.id)
+
         return {
-            'ligand': self._ligand_to_dict(ligand),
+            'ligand': self._ligand_to_dict(enriched_ligand),
             'session_id': session.id,
         }
 
@@ -341,6 +340,8 @@ class BackendServer:
     ) -> Dict[str, Any]:
         """Handle running contact analysis."""
         session = self._get_current_session(session_id)
+        if not session_id or not session:
+            raise ValueError("No session")
         if not session or not session.structure:
             raise ValueError("No structure loaded")
 
@@ -398,8 +399,9 @@ class BackendServer:
             ],
             'pocket': pocket,
             'ligand': self._ligand_to_dict(enriched_ligand),
+            'ligand_resolved': self._ligand_to_dict(enriched_ligand),
             'evidence': [
-                {'source': e.source, 'field': e.field, 'value': e.value}
+                {'source': e.source, 'field': e.field, 'value': e.value, 'url': e.url}
                 for e in evidence
             ],
             'contact_count': len(contacts),
@@ -646,20 +648,28 @@ class BackendServer:
     ) -> Dict[str, Any]:
         """Handle getting status."""
         session = self._get_current_session(session_id)
+        if not session_id or not session:
+            session = None
 
         job_status = self.job_manager.get_status_summary()
         engine_status = self.engine_registry.get_engine_status()
+        data_sources_status = self.enrichment_client.health_check()
 
-        return {
-            'session': {
-                'id': session.id if session else None,
-                'structure_id': session.structure.id if session and session.structure else None,
+        session_payload = None
+        if session:
+            session_payload = {
+                'id': session.id,
+                'structure_id': session.structure.id if session.structure else None,
                 'selected_ligand_id': session.selected_ligand_id,
                 'notes': session.notes,
-            } if session else None,
+            }
+
+        return {
+            'session': session_payload,
             'jobs': job_status,
-            'engines': engine_status,
-            'data_sources': self.enrichment_client.health_check(),
+            'engines': {name: {'available': info['available'], 'executable': info.get('executable')}
+                        for name, info in engine_status.items()},
+            'data_sources': data_sources_status,
         }
 
     def _handle_export_scene_image(

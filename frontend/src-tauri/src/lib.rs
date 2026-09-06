@@ -33,7 +33,8 @@ pub struct BackendHandle {
     pub process: Option<std::process::Child>,
     pub sender: Option<mpsc::Sender<CommandMessage>>,
     pub receiver: Option<mpsc::Receiver<CommandResponse>>,
-    pub thread: Option<thread::JoinHandle<()>>,
+    pub writer_thread: Option<thread::JoinHandle<()>>,
+    pub reader_thread: Option<thread::JoinHandle<()>>,
 }
 
 // Message types for backend communication
@@ -140,7 +141,8 @@ fn start_backend_internal() -> BackendHandle {
         process: Some(child),
         sender: Some(cmd_sender),
         receiver: Some(resp_receiver),
-        thread: Some(reader_thread.join().unwrap_or(())), // Wait for reader
+        writer_thread: Some(writer_thread),
+        reader_thread: Some(reader_thread),
     }
 }
 
@@ -189,16 +191,49 @@ async fn send_command(
     payload: serde_json::Value,
     session_id: String,
 ) -> Result<CommandResponse, String> {
-    // This would send a command to the Python backend
-    // For now, return a placeholder response
-    Ok(CommandResponse {
+    let handle = APP_STATE
+        .lock()
+        .ok()
+        .and_then(|s| s.backend.clone())
+        .and_then(|b| b.sender.clone())
+    .ok_or_else(|| "Python backend is not running".to_string())?;
+
+    let message = CommandMessage {
         command_id: uuid::Uuid::new_v4().to_string(),
-        success: true,
-        data: Some(serde_json::json!({
-            "message": "Command received"
-        })),
-        error: None,
-    })
+        command_type,
+        payload,
+        session_id,
+    };
+
+    handle
+        .send(message)
+        .map_err(|e| format!("failed to send command: {}", e))?;
+
+    // Wait for the corresponding response from the Python backend.
+    // The backend sends one JSON line per command response on stdout.
+    let receiver = handle.receiver.clone().ok_or_else(
+        || "backend response channel is not available".to_string()
+    )?;
+
+    loop {
+        match receiver.recv_timeout(Duration::from_secs(60)) {
+            Ok(response) => {
+                if response.command_id == message.command_id {
+                    return Ok(response);
+                }
+                // Still return responses that belong to this handle if the
+                // command id does not match for some reason; otherwise keep
+                // waiting for the matching command.
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("Python backend closed the response channel".to_string());
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                return Err("Python backend did not respond in time".to_string());
+            }
+        }
+    }
 }
 
 #[tauri::command]

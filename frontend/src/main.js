@@ -14,17 +14,60 @@ async function main() {
     // Create and mount the app
     const app = createApp({
       onStructureLoaded: async (structure) => {
-        // Send to backend
-        await invoke('load_structure', { structure })
+        if (structure.file_path) {
+          const result = await invoke('open_local_file', { filePath: structure.file_path })
+          if (!result || !result.success) {
+            throw new Error(result && result.error ? result.error : 'open local file failed')
+          }
+          return result.data
+        }
+        if (structure.pdb_id) {
+          const result = await invoke('open_pdb_id', { pdbId: structure.pdb_id })
+          if (!result || !result.success) {
+            throw new Error(result && result.error ? result.error : 'open PDB ID failed')
+          }
+          return result.data
+        }
+        throw new Error('structure must include file_path or pdb_id')
       },
       onLigandSelected: async (ligandId) => {
-        await invoke('select_ligand', { ligandId })
+        const result = await invoke('select_ligand', { ligandId })
+        if (!result || !result.success) {
+          throw new Error(result && result.error ? result.error : 'ligand selection failed')
+        }
+        return result.data || {}
       },
       onRunContactAnalysis: async () => {
-        await invoke('run_contact_analysis')
+        const result = await invoke('run_contact_analysis')
+        if (!result || !result.success) {
+          throw new Error(result && result.error ? result.error : 'contact analysis failed')
+        }
+        const data = result.data || {}
+        if (data.ligand_resolved) {
+          data.ligand = data.ligand_resolved
+        }
+        return data
       },
       onRunDocking: async (params) => {
-        await invoke('run_docking', { params })
+        const result = await invoke('run_docking', { params })
+        if (!result || !result.success) {
+          throw new Error(result && result.error ? result.error : 'docking failed')
+        }
+        return result.data
+      },
+      onGetStatus: async () => {
+        const result = await invoke('get_status')
+        if (!result || !result.success) {
+          throw new Error(result && result.error ? result.error : 'status fetch failed')
+        }
+        return result.data
+      },
+      onOpenPdbId: async (pdbId) => {
+        const result = await invoke('open_pdb_id', { pdbId })
+        if (!result || !result.success) {
+          throw new Error(result && result.error ? result.error : 'open PDB ID failed')
+        }
+        return result.data
       },
       onSaveArtifact: async (path) => {
         await writeTextFile(path, JSON.stringify({
