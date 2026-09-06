@@ -286,14 +286,11 @@ class VinaAdapter(EngineAdapter):
                 atom_serial += 1
 
     def _estimate_charge(self, element: str) -> float:
-        """Estimate partial charge based on element (simplified)."""
-        charges = {
-            'C': 0.0, 'H': 0.0, 'N': -0.3, 'O': -0.4,
-            'S': 0.0, 'P': 0.0, 'F': -0.2, 'CL': -0.2,
-            'BR': -0.2, 'I': -0.2, 'NA': 1.0, 'K': 1.0,
-            'CA': 2.0, 'MG': 2.0, 'ZN': 2.0,
-        }
-        return charges.get(element, 0.0)
+        # No local heuristic partial-charge table is used here.
+        # Any partial-charge assignment must come from an external source
+        # (for example CCD/force-field parameters supplied with the engine
+        # inputs), not from embedded chemical intuition.
+        return 0.0
 
     def _compute_binding_box(
         self,

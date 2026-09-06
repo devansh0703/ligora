@@ -78,6 +78,8 @@ class WaterNetworkAnalyzer:
         for chain in structure.chains:
             for residue in chain.residues:
                 if residue.name in ('HOH', 'WAT', 'SOL'):
+                    # The structure file is the source of the label; the analyzer
+                    # does not maintain its own general solvent-name table.
                     atoms = residue.atoms
                     if len(atoms) >= 1:
                         water = {

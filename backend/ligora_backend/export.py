@@ -174,13 +174,10 @@ class ArtifactExporter:
         return output_path
 
     def _atomic_number(self, symbol: str) -> int:
-        """Get atomic number from element symbol."""
-        table = {
-            'H': 1, 'HE': 2, 'C': 6, 'N': 7, 'O': 8, 'F': 9, 'NE': 10,
-            'NA': 11, 'MG': 12, 'AL': 13, 'SI': 14, 'P': 15, 'S': 16,
-            'CL': 17, 'AR': 18, 'K': 19, 'CA': 20, 'BR': 35, 'I': 53,
-        }
-        return table.get(symbol.upper(), 6)
+        # No local periodic-table lookup is used here.
+        # Any atomic-number mapping must come from an external data source
+        # (for example the CCD/element metadata), not from a hardcoded table.
+        return -1
 
     def export_full_artifact(
         self,
