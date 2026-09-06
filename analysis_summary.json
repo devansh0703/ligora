@@ -1,0 +1,26 @@
+{
+  "structure_id": "3w85",
+  "structure_title": "Unknown structure",
+  "source": "local",
+  "ligand_id": "LW85",
+  "ligand_name": "W85",
+  "ligand_formula": null,
+  "ligand_smiles": "COC(=O)C1=CC=CC(=C1)CCC2=C(NC(=O)NC2=O)C(=O)O",
+  "resolution_status": "LigandResolutionStatus.RESOLVED",
+  "contact_count": 0,
+  "contacts": [],
+  "evidence": [
+    {
+      "source": "pubchem",
+      "field": "compound_identity",
+      "value": {
+        "cid": 73167555
+      },
+      "url": "https://pubchem.ncbi.nlm.nih.gov/compound/73167555"
+    }
+  ],
+  "job_results": [],
+  "notes": "local-file repro against real mmCIF",
+  "created_at": "2026-09-06T06:21:41.841312+00:00",
+  "exported_at": "2026-09-06T06:21:41.841323+00:00"
+}
