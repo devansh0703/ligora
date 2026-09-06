@@ -112,10 +112,7 @@ class Cheminformatics:
 
             AllChem.Compute2DCoords(mol)
             conf = mol.GetConformer()
-            return [
-                (conf.GetAtomPosition(i).x, conf.GetAtomPosition(i).y, conf.GetAtomPosition(i).z)
-                for i in range(mol.GetNumAtoms())
-            ]
+            return [(conf.GetAtomPosition(i).x, conf.GetAtomPosition(i).y, conf.GetAtomPosition(i).z) for i in range(mol.GetNumAtoms())]
         except Exception:
             return None
 
@@ -251,11 +248,6 @@ class Cheminformatics:
             return None
 
     def _mol_from_atoms(self, atoms: List[Atom]):
-        """Build an RDKit mol from a list of Atom objects if coordinates are sufficient.
-
-        This is a best-effort path used when a SMILES is not available but atom
-        coordinates exist. It delegates bond perception to RDKit where possible.
-        """
         if not atoms:
             return None
         try:
@@ -280,6 +272,3 @@ class Cheminformatics:
             return candidate
         except Exception:
             return None
-
-
-
