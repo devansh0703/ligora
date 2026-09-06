@@ -695,6 +695,21 @@ body {
 
 .v2-error { color: var(--danger); }
 
+.v2-label {
+  font-size: var(--font-size-xs);
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+
+.dock-pose-btn {
+  padding: 2px 8px;
+  font-size: var(--font-size-xs);
+}
+
+.search-hit { cursor: pointer; }
+.search-hit:hover { background: var(--bg-tertiary); }
+
 .editor-toolbar {
   flex-wrap: wrap;
 }

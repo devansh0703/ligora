@@ -168,6 +168,8 @@
                 <button class="v2-tab" data-tab="editor">2D Editor</button>
                 <button class="v2-tab" data-tab="script">Console</button>
                 <button class="v2-tab" data-tab="compare">Compare</button>
+                <button class="v2-tab" data-tab="docking">Docking</button>
+                <button class="v2-tab" data-tab="search">Search</button>
             </div>
             <div class="v2-panel v2-hidden" id="v2-panel-batch">
                 <div class="v2-row">
@@ -239,6 +241,42 @@
                 </div>
                 <div class="v2-results" id="compare-results">
                     <div class="v2-placeholder">Run two Vina docking jobs first, then compare their poses (RMSD + affinity).</div>
+                </div>
+            </div>
+            <div class="v2-panel v2-hidden" id="v2-panel-docking">
+                <div class="v2-row">
+                    <label class="v2-label">Exhaustiveness</label>
+                    <input class="input" id="dock-exhaustiveness" type="number" min="1" max="64" value="8" style="max-width:90px">
+                    <label class="v2-label">Modes</label>
+                    <input class="input" id="dock-num-modes" type="number" min="1" max="20" value="5" style="max-width:80px">
+                    <button class="btn btn-primary" id="btn-dock-run">Run Docking</button>
+                </div>
+                <div class="v2-row v2-progress" id="dock-progress" style="display:none">
+                    <span class="spinner"></span>
+                    <span class="v2-progress-text" id="dock-progress-text">Running real AutoDock Vina…</span>
+                </div>
+                <div class="v2-results" id="dock-results">
+                    <div class="v2-placeholder">Docks the selected ligand into the structure (box from the ligand's own extent). Requires Vina + Open Babel; results come only from the real engine.</div>
+                </div>
+            </div>
+            <div class="v2-panel v2-hidden" id="v2-panel-search">
+                <div class="v2-row">
+                    <input class="input" id="search-input" type="text"
+                        placeholder="BM25 search: titles, compound names, formulas, IDs…">
+                    <button class="btn btn-primary" id="btn-search-run">Search</button>
+                </div>
+                <div class="v2-row v2-actions">
+                    <button class="btn btn-secondary" id="btn-search-refresh">Index current session</button>
+                    <select class="select" id="search-scope" style="max-width:150px">
+                        <option value="">All scopes</option>
+                        <option value="structures">Structures</option>
+                        <option value="chem">Chemicals</option>
+                        <option value="workspace">Workspace</option>
+                    </select>
+                    <span class="v2-progress-text" id="search-status"></span>
+                </div>
+                <div class="v2-results" id="search-results">
+                    <div class="v2-placeholder">Search indexes documents fetched live from RCSB/PubChem plus your workspace artifacts. Click “Index current session” first.</div>
                 </div>
             </div>
         </div>

@@ -40,6 +40,7 @@ from .contacts import ContactAnalyzer
 from .cheminformatics import Cheminformatics
 from .enrichment import EnrichmentClient
 from .engines import EngineRegistry, VinaAdapter
+from .search import SearchIndex
 from .jobs import JobManager
 from .export import ArtifactExporter
 from .v2.water import WaterNetworkAnalyzer
@@ -119,6 +120,8 @@ class BackendServer:
             'run_script': self._handle_run_script,
             'list_jobs': self._handle_list_jobs,
             'compare_results': self._handle_compare_results,
+            'search': self._handle_search,
+            'search_index_refresh': self._handle_search_index_refresh,
         }
 
         self._running = False
@@ -344,12 +347,23 @@ class BackendServer:
         if not ligand:
             raise ValueError(f"Ligand not found: {ligand_id}")
 
+        # An honest warning (not a refusal): water or an ion can be selected
+        # for inspection, but it is not a drug-like ligand. The classification
+        # comes from the CCD pdbx_type attached during resolution.
+        warning = None
+        if ligand.classification_hint in ('HETAS', 'HETAI'):
+            warning = (
+                f"{ligand.residue_name} is classified as "
+                f"{'solvent' if ligand.classification_hint == 'HETAS' else 'ion'} "
+                f"by the RCSB CCD, not a drug-like ligand")
+
         session.selected_ligand_id = ligand.id
         enriched = self.ligand_resolver.resolve_ligand(
             ligand, session.structure.id)
 
         return {
             'ligand': self._ligand_to_dict(enriched),
+            'warning': warning,
             'session_id': session.id,
         }
 
@@ -1222,6 +1236,53 @@ class BackendServer:
                     default=None)
             jobs.append(entry)
         return {'jobs': jobs}
+
+    # ------------------------------------------------------------------
+    # BM25 search over live-fetched documents
+    # ------------------------------------------------------------------
+
+    def _search_index(self) -> SearchIndex:
+        if not hasattr(self, '_search_idx'):
+            self._search_idx = SearchIndex()
+        return self._search_idx
+
+    def _handle_search(
+        self,
+        payload: Dict[str, Any],
+        session_id: str,
+    ) -> Dict[str, Any]:
+        query = (payload.get('query') or '').strip()
+        if not query:
+            raise ValueError("query is required")
+        index = self._search_index()
+        result = index.search(
+            query,
+            scope=payload.get('scope') or None,
+            limit=int(payload.get('limit', 20)),
+        )
+        # Auto-refresh hint: if nothing is indexed yet, tell the UI.
+        result['needs_refresh'] = result.get('documents_indexed', 0) == 0
+        return result
+
+    def _handle_search_index_refresh(
+        self,
+        payload: Dict[str, Any],
+        session_id: str,
+    ) -> Dict[str, Any]:
+        index = self._search_index()
+        # Seed from the current session's own real data first.
+        session = self._get_current_session(session_id)
+        pdb_ids = list(payload.get('pdb_ids') or [])
+        chem_names = list(payload.get('chem_names') or [])
+        if session and session.structure:
+            pdb_ids.append(session.structure.id)
+            for lig in session.structure.ligands:
+                chem_names.append(lig.residue_name)
+        if not pdb_ids and not chem_names:
+            raise ValueError(
+                "Nothing to index: open a structure or pass pdb_ids/"
+                "chem_names to fetch from live sources")
+        return index.refresh(pdb_ids=pdb_ids, chem_names=chem_names)
 
     def _handle_compare_results(
         self,

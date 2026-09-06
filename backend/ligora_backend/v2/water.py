@@ -255,34 +255,49 @@ class WaterNetworkAnalyzer:
 
         Pairs within the caller-supplied contact_cutoff are reported.
         When no cutoff is configured, all pairs are reported with distances.
+        Vectorized: one (n_waters x n_atoms) distance matrix instead of a
+        Python-level triple loop over waters/residues/atoms.
         """
+        # Flatten polymer atoms once.
+        protein_atoms = []
+        for chain in structure.chains:
+            if not chain.is_polymer:
+                continue
+            for residue in chain.residues:
+                for atom in residue.atoms:
+                    protein_atoms.append((chain.id, residue.name, residue.id,
+                                          atom.name, atom.x, atom.y, atom.z))
+        if not protein_atoms or not water_molecules:
+            return []
+
+        water_centers = np.array([w['center'] for w in water_molecules])
+        atom_xyz = np.array([[p[4], p[5], p[6]] for p in protein_atoms])
+        # Broadcasting: (n_waters, 1, 3) - (1, n_atoms, 3) -> norms.
+        diffs = water_centers[:, None, :] - atom_xyz[None, :, :]
+        dists = np.linalg.norm(diffs, axis=2)
+
         contacts = []
-        for water in water_molecules:
-            water_center = np.array(water['center'])
-            for chain in structure.chains:
-                if not chain.is_polymer:
+        cutoff = self.contact_cutoff
+        for i, water in enumerate(water_molecules):
+            for j, (chain_id, res_name, res_id, atom_name, _x, _y, _z) in \
+                    enumerate(protein_atoms):
+                dist = dists[i, j]
+                if cutoff is not None and dist > cutoff:
                     continue
-                for residue in chain.residues:
-                    for atom in residue.atoms:
-                        atom_pos = np.array([atom.x, atom.y, atom.z])
-                        dist = float(np.linalg.norm(water_center - atom_pos))
-                        if self.contact_cutoff is not None and \
-                                dist > self.contact_cutoff:
-                            continue
-                        contacts.append({
-                            'water': {
-                                'chain': water['chain_id'],
-                                'residue': water['residue_id'],
-                            },
-                            'protein': {
-                                'chain': chain.id,
-                                'residue': residue.name,
-                                'residue_id': residue.id,
-                                'atom': atom.name,
-                            },
-                            'distance': round(dist, 2),
-                            'type': 'water-protein',
-                        })
+                contacts.append({
+                    'water': {
+                        'chain': water['chain_id'],
+                        'residue': water['residue_id'],
+                    },
+                    'protein': {
+                        'chain': chain_id,
+                        'residue': res_name,
+                        'residue_id': res_id,
+                        'atom': atom_name,
+                    },
+                    'distance': round(float(dist), 2),
+                    'type': 'water-protein',
+                })
         return contacts
 
     def _analyze_conservation(

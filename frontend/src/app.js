@@ -472,11 +472,20 @@ export function createApp({ sendCommand }) {
     updateContactsPanel([], true)
     updateEvidencePanel([])
     await loadStructureIntoViewer()
-    // Auto-select the first ligand that is not solvent/ion per its CCD class.
+    // Auto-select the first ligand that is neither solvent (HETAS) nor an
+    // ion (HETAI) per its CCD classification. When the structure has none
+    // (protein-only, or ion/solvent only), select nothing and say so -
+    // never present a water molecule as the ligand.
     const first = (state.structure.ligands || []).find(
-      l => l.classification_hint && !['HETAS', 'HETAI'].includes(l.classification_hint))
-      || (state.structure.ligands || [])[0]
-    if (first) await selectLigand(first.id)
+      l => l.classification_hint &&
+        !['HETAS', 'HETAI'].includes(l.classification_hint))
+    if (first) {
+      await selectLigand(first.id)
+    } else {
+      updateLigandCard(null)
+      showStatus(`Loaded ${state.structure.id} (no drug-like ligand: only solvent/ions present)`)
+      return
+    }
     showStatus(`Loaded ${state.structure.id}`)
   }
 
@@ -488,6 +497,7 @@ export function createApp({ sendCommand }) {
       updateLigandCard(data.ligand)
       updateLigandSelect()
       applyView()
+      if (data.warning) showStatus(data.warning, true)
     } catch (e) {
       showStatus(`Ligand selection failed: ${e.message}`, true)
     }
@@ -992,6 +1002,195 @@ export function createApp({ sendCommand }) {
   }
 
   // ==================================================================
+  // V2: docking tab (real Vina run + poses rendered in the 3D viewer)
+  // ==================================================================
+
+  let lastDockJobId = null
+  let poseVisible = false
+
+  async function runDocking() {
+    if (!state.structure || !state.selectedLigandId) {
+      showStatus('Open a structure and select a ligand first', true)
+      return
+    }
+    const exhaustiveness = Math.max(1, parseInt(el('dock-exhaustiveness')?.value || '8', 10))
+    const numModes = Math.max(1, parseInt(el('dock-num-modes')?.value || '5', 10))
+    const progress = el('dock-progress')
+    if (progress) progress.style.display = 'flex'
+    const results = el('dock-results')
+    if (results) results.innerHTML = '<div class="v2-placeholder">Running real AutoDock Vina (Open Babel prep + docking)…</div>'
+    try {
+      const started = await sendCommand('run_docking', {
+        exhaustiveness, num_modes: numModes,
+      })
+      lastDockJobId = started.job_id
+      let job = null
+      for (let i = 0; i < 240; i++) {
+        job = await sendCommand('get_job', { job_id: started.job_id })
+        if (job.status === 'completed' || job.status === 'failed') break
+        await new Promise(r => setTimeout(r, 2000))
+      }
+      if (!job || job.status !== 'completed') {
+        throw new Error(job?.error || 'docking did not complete')
+      }
+      state.lastDockJob = job
+      renderDocking(job)
+      showStatus(`Docking done: ${job.result.poses.length} poses`)
+    } catch (e) {
+      if (results) results.innerHTML = `<div class="v2-error v2-summary">Docking failed: ${escapeHtml(e.message)}</div>`
+      showStatus(`Docking failed: ${e.message}`, true)
+    } finally {
+      if (progress) progress.style.display = 'none'
+    }
+  }
+
+  function renderDocking(job) {
+    const results = el('dock-results')
+    if (!results) return
+    const poses = job.result?.poses || []
+    if (poses.length === 0) {
+      results.innerHTML = '<div class="v2-placeholder">No poses returned</div>'
+      return
+    }
+    let html = `<div class="v2-summary">${poses.length} poses from Vina · box from ligand extent · job ${escapeHtml(job.job_id.slice(0, 8))}</div>`
+    html += '<table><thead><tr><th>#</th><th>Affinity kcal/mol</th><th></th></tr></thead><tbody>'
+    for (const p of poses) {
+      html += `<tr>
+        <td>${p.pose_id}</td>
+        <td>${Number(p.affinity).toFixed(2)}</td>
+        <td><button class="btn btn-secondary btn-sm dock-pose-btn" data-pose="${p.pose_id}">Show in 3D</button></td>
+      </tr>`
+    }
+    html += '</tbody></table>'
+    results.innerHTML = html
+    results.querySelectorAll('.dock-pose-btn').forEach(btn => {
+      btn.addEventListener('click', () => showPoseInViewer(
+        parseInt(btn.dataset.pose, 10)))
+    })
+  }
+
+  /** Render a real Vina pose as a model in the 3D viewer. */
+  function showPoseInViewer(poseId) {
+    if (!viewer) return
+    const job = state.lastDockJob
+    if (!job) return
+    const pose = (job.result?.poses || []).find(p => p.pose_id === poseId)
+    if (!pose) return
+    viewer.removeAllModels()
+    // Re-add the structure, then the pose atoms as a separate model.
+    loadStructureIntoViewer()
+    const pdbLines = ['MODEL        1']
+    let serial = 1
+    for (const a of pose.atoms) {
+      const elem = (a.element || 'C').toUpperCase().slice(0, 2).rjust(2)
+      pdbLines.push(
+        `HETATM${String(serial).padStart(5, ' ')}  ${(a.name || elem.trim()).padEnd(4).slice(0, 4)}` +
+        ` LIG L   1    ` +
+        `${a.x.toFixed(3).padStart(8)}${a.y.toFixed(3).padStart(8)}${a.z.toFixed(3).padStart(8)}` +
+        `  1.00  0.00          ${elem}`)
+      serial++
+    }
+    pdbLines.push('ENDMDL', 'END')
+    viewer.addModel(pdbLines.join('\n'), 'pdb')
+    viewer.setStyle({ model: 1 }, {
+      stick: { radius: 0.25, colorscheme: 'orangeCarbon' },
+      sphere: { scale: 0.3, colorscheme: 'orangeCarbon' },
+    })
+    viewer.zoomTo({ model: 1 })
+    viewer.render()
+    poseVisible = true
+    showStatus(`Pose ${poseId}: ${Number(pose.affinity).toFixed(2)} kcal/mol`)
+  }
+
+  // ==================================================================
+  // V2: BM25 search tab
+  // ==================================================================
+
+  async function runSearch() {
+    const query = el('search-input')?.value?.trim()
+    if (!query) {
+      showStatus('Type a query first', true)
+      return
+    }
+    const scope = el('search-scope')?.value || ''
+    try {
+      const data = await sendCommand('search', {
+        query, scope: scope || undefined, limit: 25,
+      })
+      renderSearch(data)
+    } catch (e) {
+      showStatus(`Search failed: ${e.message}`, true)
+    }
+  }
+
+  function renderSearch(data) {
+    const pane = el('search-results')
+    if (!pane) return
+    const status = el('search-status')
+    if (status) status.textContent = `${data.documents_indexed || 0} docs indexed`
+    if (data.needs_refresh) {
+      pane.innerHTML = '<div class="v2-placeholder">No indexed documents yet — click “Index current session” to fetch from live sources.</div>'
+      return
+    }
+    if (!data.hits || data.hits.length === 0) {
+      pane.innerHTML = `<div class="v2-placeholder">No hits for “${escapeHtml(data.query)}” in ${data.documents_indexed} indexed documents</div>`
+      return
+    }
+    let html = `<div class="v2-summary">${data.total} hits for “${escapeHtml(data.query)}” (BM25 over ${data.documents_indexed} live-fetched documents)</div>`
+    html += '<table><thead><tr><th>ID</th><th>Description</th><th>Scope</th><th>Score</th><th>Source</th></tr></thead><tbody>'
+    for (const h of data.hits) {
+      const f = h.fields || {}
+      const desc = f.title || f.name || f.text || ''
+      html += `<tr class="search-hit" data-doc="${escapeHtml(h.doc_id)}">
+        <td>${escapeHtml((f.id || h.doc_id).slice(0, 16))}</td>
+        <td>${escapeHtml(String(desc).slice(0, 60))}</td>
+        <td>${escapeHtml(h.scope)}</td>
+        <td>${Number(h.score).toFixed(3)}</td>
+        <td>${escapeHtml(h.source)}</td>
+      </tr>`
+    }
+    html += '</tbody></table>'
+    pane.innerHTML = html
+    pane.querySelectorAll('.search-hit').forEach(row => {
+      row.addEventListener('click', () => {
+        const docId = row.dataset.doc || ''
+        // A structure hit opens that PDB entry through the real fetch path.
+        if (docId.startsWith('struct:')) {
+          openPdbIdValue(docId.slice(7))
+        }
+      })
+    })
+  }
+
+  async function openPdbIdValue(pdbId) {
+    if (!/^[0-9][A-Za-z0-9]{3}$/.test(pdbId)) return
+    setBusy(true, `Fetching ${pdbId} from RCSB...`)
+    try {
+      const data = await sendCommand('open_pdb_id', { pdb_id: pdbId })
+      await onStructureLoaded(data)
+    } catch (e) {
+      showStatus(`Failed to open ${pdbId}: ${e.message}`, true)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function refreshSearchIndex() {
+    const status = el('search-status')
+    if (status) status.textContent = 'fetching from live sources…'
+    try {
+      const data = await sendCommand('search_index_refresh', {})
+      if (status) {
+        status.textContent = `${data.total} docs indexed (${data.indexed} new)`
+      }
+      showStatus(`Search index refreshed: ${data.total} documents`)
+    } catch (e) {
+      if (status) status.textContent = ''
+      showStatus(`Index refresh failed: ${e.message}`, true)
+    }
+  }
+
+  // ==================================================================
   // V2: tab switching
   // ==================================================================
 
@@ -1089,6 +1288,12 @@ export function createApp({ sendCommand }) {
     el('btn-editor-del-bond')?.addEventListener('click', () => editorBeginOp('remove_bond'))
     el('btn-script-run')?.addEventListener('click', runScript)
     el('btn-compare-run')?.addEventListener('click', runComparison)
+    el('btn-dock-run')?.addEventListener('click', runDocking)
+    el('btn-search-run')?.addEventListener('click', runSearch)
+    el('btn-search-refresh')?.addEventListener('click', refreshSearchIndex)
+    el('search-input')?.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') runSearch()
+    })
 
     await refreshStatus()
   }
