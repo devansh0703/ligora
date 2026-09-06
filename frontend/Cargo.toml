@@ -1,0 +1,21 @@
+[package]
+name = "ligora"
+version = "0.1.0"
+description = "Molecular analysis workstation"
+authors = ["Ligora Team"]
+edition = "2021"
+
+[lib]
+name = "ligora_lib"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.0", features = [] }
+
+[dependencies]
+tauri = { version = "2.0", features = ["devtools"] }
+tauri-plugin-shell = "2.0"
+tauri-plugin-dialog = "2.0"
+tauri-plugin-fs = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
