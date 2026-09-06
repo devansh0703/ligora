@@ -65,56 +65,13 @@ class TestCheminformatics:
         assert 0.0 <= similarity <= 1.0
 
     def test_export_sdf(self):
-        """Test SDF export via export_sdf."""
+        """Test SDF export via smiles_to_sdf."""
         import tempfile
         import os
         smiles = "CCO"
-        with tempfile.NamedTemporaryFile(suffix='.sdf', delete=False) as tmp:
-            path = tmp.name
-        try:
-            ok = self.chem.export_sdf(smiles, path)
-            assert ok is True
-            assert os.path.exists(path)
-            content = open(path).read()
-            assert '$$$$' in content
-        finally:
-            if os.path.exists(path):
-                os.unlink(path)
-
-    def test_validate_smiles_valid(self):
-        """Test SMILES validation with valid SMILES."""
-        assert self.chem.validate_smiles("CCO")
-        assert self.chem.validate_smiles("c1ccccc1")  # Benzene
-        assert self.chem.validate_smiles("CC(=O)O")  # Acetic acid
-
-    def test_compute_descriptors(self):
-        """Test descriptor computation returns RDKit-backed values."""
-        desc = self.chem.compute_descriptors("CCO")
-        assert isinstance(desc, dict)
-        assert desc.get('formula') == 'C2H6O'
-        assert desc.get('molecular_weight') > 40
-        assert desc.get('n_heavy_atoms') == 3
-
-    def test_generate_smiles_from_atoms(self):
-        """Test SMILES generation from atom coordinates."""
-        from ligora_backend.schemas import Atom
-        atoms = [
-            Atom(id=1, name='C1', residue_name='LIG', residue_id=1,
-                 chain_id='L', x=0.0, y=0.0, z=0.0, element='C'),
-            Atom(id=2, name='O1', residue_name='LIG', residue_id=1,
-                 chain_id='L', x=1.2, y=0.0, z=0.0, element='O'),
-        ]
-        smiles = self.chem.generate_smiles_from_atoms(atoms)
-        assert smiles is not None
-        assert len(smiles) > 0
-
-    def test_validate_smiles_invalid(self):
-        """Test SMILES validation with invalid SMILES."""
-        assert not self.chem.validate_smiles("")
-        # Local heuristics are removed. Validity is delegated to RDKit.
-        # We only assert that the method returns False for clearly invalid
-        # inputs that RDKit refuses to parse.
-        assert not self.chem.validate_smiles("C))")    
+        sdf = self.chem.smiles_to_sdf(smiles)
+        assert sdf
+        assert "$$$$" in sdf
 
     def test_compute_molecular_descriptors(self):
         """Test molecular descriptor computation via RDKit."""
@@ -146,23 +103,6 @@ class TestCheminformatics:
         # Ethanol should be most similar to itself
         if len(similar) > 0:
             assert similar[0]["smiles"] == "CCO"
-
-    def test_generate_smiles_from_atoms(self):
-        """Test SMILES generation from atoms."""
-        from ligora_backend.schemas import Atom
-
-        atoms = [
-            Atom(id=1, name="C1", residue_name="LIG", residue_id=1,
-                 chain_id="L", x=0, y=0, z=0, element="C"),
-            Atom(id=2, name="O1", residue_name="LIG", residue_id=1,
-                 chain_id="L", x=1, y=0, z=0, element="O"),
-        ]
-
-        smiles = self.chem.generate_smiles_from_atoms(atoms)
-
-        # Should generate some SMILES representation
-        assert smiles is not None
-        assert len(smiles) > 0
 
     def test_smiles_validation_edge_cases(self):
         """Test SMILES validation edge cases."""

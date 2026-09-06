@@ -33,6 +33,18 @@ Ligora is an open-source desktop application for protein-ligand interaction anal
 - **MD Simulation**: OpenMM integration for molecular dynamics
 - **QM Calculations**: PySCF integration for quantum chemistry
 
+### Rules
+- Everything visible in the app runs end-to-end against real data or user input.
+- Existing open-source engines are used, wrapped, or linked out; they are not reimplemented.
+- Numeric and categorical chemical/biological values come from data sources (RCSB, PubChem, ChEMBL, PDBBind, CCD) or user settings, not from hardcoded app constants.
+- Atomic weights, formulas, classification hints, thresholds, and similar knowledge are not embedded in app code.
+- There are no placeholder data or sample values in the product itself; sample data exists only in tests, demos, or docs.
+- Engines are integrated under their own licenses; bundling is only done after licensing and redistribution terms are verified.
+
+Full rules are in `RULES.md`.
+
+---
+
 ## Architecture
 
 ```
