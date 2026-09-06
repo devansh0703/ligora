@@ -3,7 +3,7 @@ Shared schemas and types for Ligora IPC.
 These are used by both the Tauri frontend (via JSON) and the Python backend.
 """
 from dataclasses import dataclass, field, asdict
-from typing import Optional, List, Dict, Any, Literal
+from typing import Optional, List, Dict, Any
 from enum import Enum
 import json
 
@@ -94,7 +94,7 @@ class Ligand:
     pubchem_name: Optional[str] = None
     chembl_id: Optional[str] = None
     pdbbind_affinity: Optional[float] = None
-    classification_hint: str = "unknown"
+    classification_hint: Optional[str] = None  # Must come from data sources (CCD/PubChem/ChEMBL)
     has_2d_structure: bool = False
     iupac_name: Optional[str] = None
 

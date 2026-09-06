@@ -2,16 +2,14 @@
 numpy>=1.24.0
 requests>=2.28.0
 
-# Cheminformatics (required for fingerprints, similarity, SDF, descriptors)
-rdkit-pypi>=2026.03.0
+# Cheminformatics (fingerprints, similarity, SDF, bond perception, descriptors)
+rdkit>=2024.9.1
 
-# Optional engine adapters (bundled separately or installed in workspace)
-# - AutoDock Vina (Apache 2.0)
-# - gnina (GPL/Apache)
-# - OpenMM (open, Python)
-# - PySCF (Apache 2.0)
-# - PLIP (GPL) for contact analysis
-
-# Snapcraft parts reference:
-# - python-requirements can point at this file
-# - See snap/snapcraft.yaml for installed system packages
+# External tools used when present (installed via system packages, never faked):
+# - PLIP (GPL) for contact analysis        -> apt install plip
+# - Open Babel for PDBQT prep/minimization -> apt install obabel
+# - AutoDock Vina (Apache 2.0) for docking -> snap install vina / build from
+#   source (see snap/snapcraft.yaml vina part) or apt install autodock-vina
+#
+# When a tool is absent the backend reports it as unavailable; results are
+# never simulated.

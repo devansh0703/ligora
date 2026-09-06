@@ -11,19 +11,13 @@ Provides:
 import uuid
 import threading
 import time
-import json
-from pathlib import Path
 from typing import Optional, Dict, Any, Callable, List
-from dataclasses import dataclass, field
 
 from .schemas import (
     Job,
     JobStatus,
     EngineType,
-    Command,
-    CommandResponse,
 )
-from .config import get_config
 
 
 class JobManager:

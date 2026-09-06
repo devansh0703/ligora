@@ -4,7 +4,6 @@ Scripting console for Ligora.
 Allows users to run Python scripts for custom analysis and automation.
 """
 
-import textwrap
 from typing import Optional, Dict, Any, List
 from pathlib import Path
 
@@ -29,12 +28,15 @@ class ScriptingConsole:
         self._history: List[str] = []
         self._imports: Dict[str, Any] = {}
 
-    def execute(self, code: str) -> Dict[str, Any]:
+    def execute(self, code: str,
+                context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
         Execute a Python script.
 
         Args:
             code: Python code to execute.
+            context: Session variables (e.g. structure, selected_ligand_id)
+                exposed to the script.
 
         Returns:
             Execution result.
@@ -44,6 +46,7 @@ class ScriptingConsole:
             namespace = {
                 **self._imports,
                 **self._variables,
+                **(context or {}),
                 'ligora': self._get_ligora_api(),
             }
 
@@ -54,6 +57,7 @@ class ScriptingConsole:
             self._variables.update({
                 k: v for k, v in namespace.items()
                 if not k.startswith('_') and not callable(v)
+                and k not in (context or {})
             })
 
             # Record history

@@ -2,29 +2,22 @@
 Batch analysis for processing multiple structures.
 """
 
+from __future__ import annotations
+
 import uuid
 import json
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Callable
 from dataclasses import dataclass, field
 
-from pathlib import Path
-from typing import Optional, List, Dict, Any, Callable
-import uuid
-import json
-import time
-
 from ..schemas import (
     Structure,
     Ligand,
-    Contact,
     AnalysisSummary,
-    Job,
-    JobStatus,
-    EngineType,
 )
-from ..workspace import WorkspaceManager, Session
+from ..workspace import WorkspaceManager
 from ..parser import StructureParser
 from ..ligand import LigandResolver
 from ..contacts import ContactAnalyzer
@@ -119,6 +112,13 @@ class BatchAnalyzer:
                 if not structure:
                     task.status = BatchTaskStatus.FAILED
                     task.error = "Failed to load structure"
+                    results.append(BatchResult(
+                        task_id=task.id,
+                        structure_id=task.source,
+                        summary=None,
+                        success=False,
+                        error=task.error,
+                    ))
                     continue
 
                 # Get primary ligand
@@ -127,12 +127,24 @@ class BatchAnalyzer:
                 if not ligand:
                     task.status = BatchTaskStatus.FAILED
                     task.error = "No ligand found"
+                    results.append(BatchResult(
+                        task_id=task.id,
+                        structure_id=structure.id or task.source,
+                        summary=None,
+                        success=False,
+                        error=task.error,
+                    ))
                     continue
 
-                # Run contact analysis
-                contacts = self.contact_analyzer.analyze_contacts(
-                    structure, ligand
-                )
+                # Run contact analysis (returns (contacts, plip_available))
+                contacts, plip_available = \
+                    self.contact_analyzer.analyze_contacts(
+                        structure, ligand
+                    )
+                if not plip_available:
+                    raise RuntimeError(
+                        "PLIP is not installed; contact analysis cannot "
+                        "run - results are never simulated")
 
                 # Resolve ligand identity
                 enriched_ligand = self.ligand_resolver.resolve_ligand(
@@ -182,8 +194,8 @@ class BatchAnalyzer:
                     ],
                     job_results=[],
                     notes="",
-                    created_at=time.time(),
-                    exported_at=time.time(),
+                    created_at=datetime.now(timezone.utc).isoformat(),
+                    exported_at=datetime.now(timezone.utc).isoformat(),
                 )
 
                 task.status = BatchTaskStatus.COMPLETED
@@ -321,12 +333,36 @@ class BatchAnalyzer:
         return output_dir
 
     def _get_results_for_batch(self, batch_id: str) -> List['BatchResult']:
-        """Get results for a batch."""
+        """Get results for a batch (one BatchResult per finished task)."""
         batch = self._batch_jobs.get(batch_id)
         if not batch:
             return []
 
-        return [t.result for t in batch.tasks if t.result is not None]
+        out: List[BatchResult] = []
+        for task in batch.tasks:
+            if isinstance(task.result, BatchResult):
+                out.append(task.result)
+            elif task.result is not None:
+                # Success path stores the AnalysisSummary on the task.
+                out.append(BatchResult(
+                    task_id=task.id,
+                    structure_id=(
+                        task.result.structure_id
+                        if getattr(task.result, 'structure_id', None)
+                        else task.source),
+                    summary=task.result,
+                    success=task.status == BatchTaskStatus.COMPLETED,
+                    error=task.error,
+                ))
+            elif task.status == BatchTaskStatus.FAILED:
+                out.append(BatchResult(
+                    task_id=task.id,
+                    structure_id=task.source,
+                    summary=None,
+                    success=False,
+                    error=task.error,
+                ))
+        return out
 
 
 @dataclass

@@ -2,189 +2,153 @@ name: ligora
 version: '0.1.0'
 summary: Molecular analysis workstation
 description: |
-  Ligora is a molecular analysis workstation for protein-ligand interaction analysis.
-  
-  Features:
-  - Open and visualize PDB/mmCIF structures
-  - Detect and analyze protein-ligand contacts
-  - Run molecular docking with AutoDock Vina
-  - Enrich ligand data from PubChem, ChEMBL, PDBBind
-  - Export analysis artifacts
+  Ligora is a molecular analysis workstation for protein-ligand interaction
+  analysis built on open data sources and open engines.
 
-confinement: strict
+  Features:
+  - Open and visualize PDB/mmCIF structures (3Dmol.js viewer)
+  - Real protein-ligand contact analysis via PLIP
+  - Molecular docking with AutoDock Vina
+  - Real geometry cleanup and PDBQT preparation via Open Babel
+  - Live ligand enrichment from RCSB CCD, PubChem, ChEMBL and UniChem
+  - Batch analysis, water networks, 2D editor, scripting console
+  - Export analysis artifacts (JSON summary, contacts CSV, ligand SDF)
+
 grade: stable
+confinement: strict
 base: core22
 
-# Architectures
 architectures:
   - build-on: amd64
     run-on: amd64
 
-# Parts
-parts:
-  # Python backend
-  ligora-backend:
-    plugin: python
-    python-requirements:
-      - requirements.txt
-    source: ../backend
-
-
-    build-packages:
-      - python3
-      - python3-pip
-      - python3-numpy
-      - python3-dev
-      - libjpeg-dev
-      - zlib1g-dev
-      - libfreetype6-dev
-      - libpng-dev
-    stage-packages:
-      - python3
-      - python3-numpy
-      - python3-requests
-      - python3-pil
-      - python3-tk
-
-  # Tauri application
-  ligora-app:
-    plugin: nil
-    source: ../frontend
-    build-snaps:
-      - node/20/stable
-    build-packages:
-      - curl
-      - wget
-      - libssl-dev
-      - libgtk-3-dev
-      - libayatana-appindicator3-dev
-      - librsvg2-dev
-    override-build: |
-      # Install Node.js
-      export PATH="$PATH:$HOME/.local/share/snapd/snap/bin"
-      
-      # Install dependencies
-      cd "$SNAPCRAFT_PART_SRC"
-      npm install
-      
-      # Build Tauri application
-      npm run tauri build
-      
-      # Copy output to stage
-      mkdir -p "$SNAPCRAFT_PART_INSTALL"
-      cp -r src-tauri/target/release/bundle/* "$SNAPCRAFT_PART_INSTALL/"
-    stage-packages:
-      - libgtk-3-0
-      - libgdk-pixbuf2.0-0
-      - libayatana-appindicator3-1
-      - libasound2
-      - libnss3
-      - libxss1
-      - libx11-6
-      - libgl1-mesa-glx
-      - libxcb-randr0
-      - libxcb-xinerama0
-      - libxcb-shape0
-
-  # AutoDock Vina (open source, Apache 2.0)
-  vina:
-    plugin: nil
-    build-packages:
-      - g++-11
-      - cmake
-      - zlib1g-dev
-      - libxml2-dev
-      - libboost-graph-dev
-      - libboost-program-options-dev
-    override-build: |
-      set -x
-      cd /tmp
-      curl -fsSL -o vina-src.zip \
-        "https://github.com/ccsb-scripps/autoDock-Vina/archive/refs/tags/v1.2.3.zip"
-      unzip -o vina-src.zip
-      cd autoDock-Vina-1.2.3
-
-      mkdir -p build && cd build
-      cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local -DCMAKE_BUILD_TYPE=Release \
-        -DXMLPP_ROOT=/usr
-      make -j$(nproc)
-      make install
-
-      mkdir -p "$SNAPCRAFT_PART_INSTALL/bin"
-      cp /usr/local/bin/vina "$SNAPCRAFT_PART_INSTALL/bin/"
-      cp -r /usr/local/share/vina* "$SNAPCRAFT_PART_INSTALL/share/" 2>/dev/null || true
-    stage-packages: []
-
-  # PLIP (GPL, for contact analysis)
-  plip:
-    plugin: python
-    python-requirements:
-      - ./plip-requirements.txt
-    source: plip-source
-    build-packages:
-      - python3-dev
-      - python3-setuptools
-    stage-packages:
-      - python3
-
-  # Icon files
-  icon:
-    plugin: nil
-    source: icons
-    override-build: |
-      mkdir -p "$SNAPCRAFT_PART_INSTALL/meta/"
-      cp -r "$SNAPCRAFT_PART_SRC"/* "$SNAPCRAFT_PART_INSTALL/"
-    stage-packages: []
-
-# Apps
 apps:
   ligora:
-    command: bin/ligora
-    extensions:
-      - gnome
+    command: bin/ligora-wrapper
+    extensions: [gnome]
     environment:
       LIGORA_BASE_DIR: $SNAP_USER_COMMON
-      LIGORA_DATA_DIR: $SNAP_USER_DATA
-      PATH: $SNAP/bin:$SNAP/usr/bin:$PATH
-      PYTHONPATH: $SNAP/lib/python3/dist-packages:$SNAP/usr/lib/python3/dist-packages
-      LD_LIBRARY_PATH: $SNAP/usr/lib:$SNAP_LIBRARY_PATH
-      RDKIT_BASE: $SNAP/usr
+      # Python backend package shipped inside the snap.
+      LIGORA_BACKEND_DIR: $SNAP/usr/lib/ligora-backend
+      # python3 from the core22 base.
+      LIGORA_PYTHON: $SNAP/usr/bin/python3
+      # Engine executables staged from real distro packages below.
+      PATH: $SNAP/usr/bin:$SNAP/bin:$PATH
+      PLIP_PATH: $SNAP/usr/bin/plip
     plugs:
       - desktop
-      - desktop-legacy
       - x11
       - wayland
       - opengl
       - home
       - network
-      - shell
-      - removable-media
 
-# Plugs
-plugs:
-  shell:
-    interface: shell
-    command-chain:
-      - bin/init-shell
+parts:
+  ligora-backend:
+    plugin: python
+    source: ../backend
+    python-requirements: [requirements.txt]
+    build-packages:
+      - python3-dev
+      - libjpeg-dev
+      - zlib1g-dev
+      - libfreetype6-dev
+      - libpng-dev
+    override-pull: |
+      craftctl default
+      # Keep the python plugin's site-packages layout predictable.
+      craftctl set env "PIP_NO_WARN_SCRIPT_LOCATION=1"
+    override-build: |
+      craftctl default
+      # Expose the package where the wrapper and Rust bridge expect it.
+      mkdir -p "$SNAPCRAFT_PART_INSTALL/usr/lib/ligora-backend"
+      site="$SNAPCRAFT_PART_INSTALL/lib/python3.10/site-packages"
+      if [ -d "$site/ligora_backend" ]; then
+        cp -r "$site/ligora_backend" \
+          "$SNAPCRAFT_PART_INSTALL/usr/lib/ligora-backend/"
+      fi
 
-# Extra files to include
-extra-files:
-  - snap/local/bin/init-shell
-  - snap/local/bin/ligora-wrapper
+  ligora-app:
+    plugin: nil
+    source: ../frontend
+    build-snaps: [node/20/stable]
+    build-packages:
+      - curl
+      - libssl-dev
+      - libgtk-3-dev
+      - libwebkit2gtk-4.1-dev
+      - libayatana-appindicator3-dev
+      - librsvg2-dev
+      - patchelf
+    override-build: |
+      set -x
+      cd "$SNAPCRAFT_PART_SRC"
+      npm install
+      # Build the Tauri app (frontend + Rust bridge) without bundling debs.
+      npx tauri build --no-bundle
+      mkdir -p "$SNAPCRAFT_PART_INSTALL/bin"
+      cp src-tauri/target/release/ligora "$SNAPCRAFT_PART_INSTALL/bin/ligora"
 
-# Build options
-build-options:
-  build-snaps:
-    - node/20/stable
-  build-packages:
-    - python3
-    - python3-pip
-    - python3-venv
-    - cmake
-    - g++
-    - libgtk-3-dev
-    - nodejs
+  engines:
+    plugin: nil
+    stage-packages:
+      # Real analysis engines from the distro - the backend detects and
+      # uses them; when absent it reports unavailability, never fakes.
+      - autodock-vina
+      - plip
+      - openbabel
+      # Runtime libraries the engines and GUI need.
+      - libxml2
+      - zlib1g
+      - libboost-program-options1.74
+      - libboost-serialization1.74
+      - libboost-system1.74
+      - libboost-graph1.74
+      # Python runtime for the backend process (base core22 provides it,
+      # listed explicitly so the wrapper's interpreter is guaranteed).
+      - python3
+      - python3-minimal
+      - libpython3.10-stdlib
+      - libpython3.10-minimal
+      # 3D rendering stack used by the webview and WebGL viewer.
+      - libgl1
+      - libegl1
+      - libnss3
+      - libxss1
+      - libgbm1
+      - libasound2
+      - libatk-bridge2.0-0
+      - libatk1.0-0
+      - libcups2
+      - libxkbcommon0
+      - libatspi2.0-0
+      - libdrm2
+      - libxcomposite1
+      - libxdamage1
+      - libxfixes3
+      - libxrandr2
+      - libpango-1.0-0
+      - libcairo2
+      - libgdk-pixbuf-2.0-0
 
-# Grade and confinement settings
-grade: devel
-confinement: classic
+  wrappers:
+    plugin: dump
+    source: .
+    override-build: |
+      set -x
+      mkdir -p "$SNAPCRAFT_PART_INSTALL/bin"
+      cat > "$SNAPCRAFT_PART_INSTALL/bin/ligora-wrapper" <<'EOF'
+      #!/bin/bash
+      # Ligora snap launcher: wires the real engine paths and starts the
+      # Tauri app, which spawns the Python backend via LIGORA_* variables.
+      export LIGORA_BASE_DIR="${LIGORA_BASE_DIR:-$SNAP_USER_COMMON}"
+      export LIGORA_BACKEND_DIR="$SNAP/usr/lib/ligora-backend"
+      export LIGORA_PYTHON="$SNAP/usr/bin/python3"
+      export PATH="$SNAP/usr/bin:$SNAP/bin:$PATH"
+      export PLIP_PATH="$SNAP/usr/bin/plip"
+      # Open Babel needs its own share dir for format plugins.
+      export BABEL_DATADIR="$SNAP/usr/share/openbabel"
+      export LD_LIBRARY_PATH="$SNAP/usr/lib/$SNAPCRAFT_ARCH_TRIPLET:$LD_LIBRARY_PATH"
+      exec "$SNAP/bin/ligora" "$@"
+      EOF
+      chmod +x "$SNAPCRAFT_PART_INSTALL/bin/ligora-wrapper"

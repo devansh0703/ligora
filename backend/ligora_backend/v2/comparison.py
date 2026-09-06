@@ -2,8 +2,7 @@
 Result comparison for docking and analysis results.
 """
 
-from typing import Optional, List, Dict, Any, Tuple
-from dataclasses import dataclass, field
+from typing import Optional, List, Dict, Any
 from pathlib import Path
 
 import numpy as np
@@ -68,10 +67,10 @@ class ResultComparator:
                 comparisons.append({
                     'pose1': i + 1,
                     'pose2': j + 1,
-                    'rmsd': round(rmsd, 2),
+                    'rmsd': round(float(rmsd), 2),
                     'pose1_affinity': pose1.affinity,
                     'pose2_affinity': pose2.affinity,
-                    'energy_diff': round(energy_diff, 2),
+                    'energy_diff': round(float(energy_diff), 2),
                 })
 
         # Find best matches
@@ -83,7 +82,7 @@ class ResultComparator:
             'comparisons': comparisons,
             'best_matches': matches,
             'avg_rmsd': round(
-                np.mean([c['rmsd'] for c in comparisons]), 2
+                float(np.mean([c['rmsd'] for c in comparisons])), 2
             ) if comparisons else 0,
         }
 
@@ -109,7 +108,7 @@ class ResultComparator:
             sum_sq += dx*dx + dy*dy + dz*dz
 
         n = len(atoms1)
-        return np.sqrt(sum_sq / n) if n > 0 else 0.0
+        return float(np.sqrt(sum_sq / n)) if n > 0 else 0.0
 
     def _compute_superposed_rmsd(
         self,
@@ -172,7 +171,7 @@ class ResultComparator:
             diff = coords1_rotated - coords2_centered
             rmsd = np.sqrt(np.sum(diff * diff) / len(coords1))
 
-            return rmsd
+            return float(rmsd)
 
         except np.linalg.LinAlgError:
             return float('inf')
@@ -285,7 +284,7 @@ class ResultComparator:
         # Simple average
         avg_pose = DockingPose(
             pose_id=0,
-            affinity=np.mean([p.affinity for p in all_poses]),
+            affinity=float(np.mean([p.affinity for p in all_poses])),
             ligand_name=all_poses[0].ligand_name,
             atoms=[],
         )

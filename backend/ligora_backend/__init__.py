@@ -18,7 +18,7 @@ from .ligand import LigandResolver
 from .contacts import ContactAnalyzer
 from .cheminformatics import Cheminformatics
 from .enrichment import EnrichmentClient
-from .engines import EngineAdapter, VinaAdapter, GninaAdapter, EngineRegistry
+from .engines import VinaAdapter, GninaAdapter, EngineRegistry
 from .jobs import JobManager
 from .export import ArtifactExporter
 from .server import BackendServer, start_server
@@ -34,7 +34,6 @@ __all__ = [
     "ContactAnalyzer",
     "Cheminformatics",
     "EnrichmentClient",
-    "EngineAdapter",
     "VinaAdapter",
     "GninaAdapter",
     "EngineRegistry",

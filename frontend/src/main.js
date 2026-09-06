@@ -1,103 +1,65 @@
 /**
  * Ligora - Molecular Analysis Workstation
- * Main application entry point
+ * Entry point: wires the UI (app.js) to the Python backend.
+ *
+ * Two transports, one backend:
+ * - Tauri app: commands go through the Rust bridge (`send_command` IPC),
+ *   which spawns the Python backend and correlates responses by id.
+ * - Browser (dev harness): `window.__LIGORA_BRIDGE__` is injected by the
+ *   automation environment and posts to the dev-bridge HTTP endpoint,
+ *   which drives the same real Python backend over its stdio IPC.
  */
 
 import { invoke } from '@tauri-apps/api/core'
-import { open } from '@tauri-apps/plugin-dialog'
-import { readTextFile, writeTextFile } from '@tauri-apps/plugin-fs'
 import { createApp } from './app'
 
-// Initialize the app
-async function main() {
-  try {
-    // Create and mount the app
-    const app = createApp({
-      onStructureLoaded: async (structure) => {
-        if (structure.file_path) {
-          const result = await invoke('open_local_file', { filePath: structure.file_path })
-          if (!result || !result.success) {
-            throw new Error(result && result.error ? result.error : 'open local file failed')
-          }
-          return result.data
-        }
-        if (structure.pdb_id) {
-          const result = await invoke('open_pdb_id', { pdbId: structure.pdb_id })
-          if (!result || !result.success) {
-            throw new Error(result && result.error ? result.error : 'open PDB ID failed')
-          }
-          return result.data
-        }
-        throw new Error('structure must include file_path or pdb_id')
-      },
-      onLigandSelected: async (ligandId) => {
-        const result = await invoke('select_ligand', { ligandId })
-        if (!result || !result.success) {
-          throw new Error(result && result.error ? result.error : 'ligand selection failed')
-        }
-        return result.data || {}
-      },
-      onRunContactAnalysis: async () => {
-        const result = await invoke('run_contact_analysis')
-        if (!result || !result.success) {
-          throw new Error(result && result.error ? result.error : 'contact analysis failed')
-        }
-        const data = result.data || {}
-        if (data.ligand_resolved) {
-          data.ligand = data.ligand_resolved
-        }
-        return data
-      },
-      onRunDocking: async (params) => {
-        const result = await invoke('run_docking', { params })
-        if (!result || !result.success) {
-          throw new Error(result && result.error ? result.error : 'docking failed')
-        }
-        return result.data
-      },
-      onGetStatus: async () => {
-        const result = await invoke('get_status')
-        if (!result || !result.success) {
-          throw new Error(result && result.error ? result.error : 'status fetch failed')
-        }
-        return result.data
-      },
-      onOpenPdbId: async (pdbId) => {
-        const result = await invoke('open_pdb_id', { pdbId })
-        if (!result || !result.success) {
-          throw new Error(result && result.error ? result.error : 'open PDB ID failed')
-        }
-        return result.data
-      },
-      onSaveArtifact: async (path) => {
-        await writeTextFile(path, JSON.stringify({
-          type: 'artifact',
-          timestamp: new Date().toISOString(),
-        }))
-      },
-    })
+// Session state shared by all commands.
+const sessionState = { id: null }
 
-    // Mount to DOM
-    const container = document.getElementById('app')
-    if (container) {
-      container.appendChild(app)
-    }
+const IN_TAURI = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
 
-    // Start the app
-    app.start()
-
-  } catch (error) {
-    console.error('Failed to initialize Ligora:', error)
-    document.body.innerHTML = `
-      <div style="padding: 20px; color: red;">
-        <h2>Failed to initialize Ligora</h2>
-        <p>${error.message || error}</p>
-      </div>
-    `
+async function tauriSendCommand(type, payload = {}) {
+  const response = await invoke('send_command', {
+    commandType: type,
+    payload: payload,
+    sessionId: sessionState.id || '',
+  })
+  if (!response || response.success !== true) {
+    throw new Error(
+      (response && response.error) || `backend command failed: ${type}`)
   }
+  const data = response.data || {}
+  if (data.session_id) {
+    sessionState.id = data.session_id
+  }
+  return data
 }
 
-// Run when DOM is ready
+async function bridgeSendCommand(type, payload = {}) {
+  const bridge = window.__LIGORA_BRIDGE__
+  if (!bridge) throw new Error('dev bridge not available')
+  const response = await bridge(type, payload)
+  if (!response.success) throw new Error(response.error || `${type} failed`)
+  const data = response.data || {}
+  if (data.session_id) sessionState.id = data.session_id
+  return data
+}
+
+const sendCommand = IN_TAURI ? tauriSendCommand : bridgeSendCommand
+
+async function main() {
+  const app = createApp({ sendCommand, sessionState })
+
+  const container = document.getElementById('app')
+  if (container) {
+    // index.html already contains the full static layout; app.js upgrades
+    // it in place (viewer + panel bindings) instead of duplicating it.
+    app.upgrade(container)
+  }
+
+  await app.start()
+}
+
 if (document.readyState === 'loading') {
   document.addEventListener('DOMContentLoaded', main)
 } else {

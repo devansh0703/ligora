@@ -17,11 +17,8 @@ from typing import Optional, Dict, Any, List
 from dataclasses import dataclass, field
 
 from .schemas import (
-    Session as SessionSchema,
     Structure,
     Job,
-    JobStatus,
-    EngineType,
 )
 
 

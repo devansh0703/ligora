@@ -3,12 +3,9 @@
 """
 
 from typing import Optional, List, Dict, Any, Tuple
-from pathlib import Path
-from dataclasses import dataclass, field
 
-import numpy as np
 
-from ..schemas import Atom, Ligand, Ligand as LigandSchema
+from ..schemas import Atom, Ligand
 from ..cheminformatics import Cheminformatics
 
 
@@ -39,6 +36,7 @@ class Ligand2DEditor:
                 'id': atom.id,
                 'name': atom.name,
                 'element': atom.element,
+                'residue_name': atom.residue_name,
                 'x': atom.x,
                 'y': atom.y,
                 'z': atom.z,
@@ -59,11 +57,16 @@ class Ligand2DEditor:
         }
 
     def _infer_bonds(self):
-        """Infer bonds from 3D coordinates using RDKit.
+        """Bond topology from real sources, tried in order:
 
-        Bond inference is delegated to RDKit's coordinate-based molecule
-        building where possible. When RDKit cannot build a molecule, bonds
-        remain empty and the caller must supply topology.
+        1. The CCD's own `_chem_comp_bond` records mapped by atom name
+           (authoritative; works even when RDKit cannot perceive from
+           coordinates).
+        2. RDKit molecule building (perception + CCD records inside
+           Cheminformatics), with H atoms removed from the editor view and
+           heavy-heavy bond indices mapped through the mol-block atom
+           ordering.
+        Otherwise bonds stay empty and the caller supplies topology.
         """
         self._bonds = []
         if not self._atoms:
@@ -71,27 +74,45 @@ class Ligand2DEditor:
 
         try:
             from rdkit import Chem
-            from rdkit.Chem import rdmolops
+            chem = Cheminformatics()
+            atoms = [Atom(id=a['id'], name=a['name'],
+                          residue_name=a.get('residue_name') or 'LIG',
+                          residue_id=1, chain_id='L',
+                          x=a['x'], y=a['y'], z=a.get('z', 0.0),
+                          element=a['element']) for a in self._atoms]
+            mol_block = chem.mol_block_from_atoms(atoms)
+            if mol_block is None:
+                return
 
-            mol = Chem.MolFromMolBlock(
-                Cheminformatics()._sdf_export_from_atoms(self._atoms),
-                removeHs=False,
-            )
+            mol = Chem.MolFromMolBlock(mol_block, removeHs=False,
+                                       sanitize=True)
             if mol is None:
                 return
 
-            mol = rdmolops.RemoveHs(mol, updateAtomMap=True)
+            # Mol-block atom order: input atoms first (same order), then
+            # any hydrogens appended by the CCD-bond path. Only heavy-atom
+            # pairs within the input range map back to the editor view.
+            n_input = len(self._atoms)
+
             for bond in mol.GetBonds():
-                a1 = bond.GetBeginAtomIdx()
-                a2 = bond.GetEndAtomIdx()
-                order = bond.GetBondType()
+                i = bond.GetBeginAtomIdx()
+                j = bond.GetEndAtomIdx()
+                if i >= n_input or j >= n_input:
+                    continue
+                ai, aj = self._atoms[i], self._atoms[j]
+                if ((ai.get('element') or '').upper() == 'H' or
+                        (aj.get('element') or '').upper() == 'H'):
+                    continue
+                order = bond.GetBondTypeAsDouble()
+                order_int = {1.0: 1, 1.5: 1, 2.0: 2, 3.0: 3}.get(
+                    order, 1)
                 self._bonds.append({
-                    'from': int(a1),
-                    'to': int(a2),
-                    'order': int(order),
+                    'from': ai['id'],
+                    'to': aj['id'],
+                    'order': order_int,
                 })
         except Exception:
-            return
+            self._bonds = []
 
     def _estimate_bond_order(
         self,
@@ -99,33 +120,18 @@ class Ligand2DEditor:
         atom2: Dict[str, Any],
         distance: float,
     ) -> int:
-        """No local bond-order estimation.
+        """Bond order from the inferred topology (RDKit/CCD derived).
 
-        Bond order must come from external structure data or an editor
-        toolkit. This method now delegates to RDKit when a molecule can
-        be built, and returns a neutral placeholder only as a last resort.
+        Returns the order already inferred for this atom pair, or 1 when the
+        pair is not bonded. No per-distance heuristics are applied.
         """
-        try:
-            from rdkit import Chem
-            from rdkit.Chem import rdmolops
-
-            mol = Chem.MolFromMolBlock(
-                Cheminformatics()._sdf_export_from_atoms(self._atoms),
-                removeHs=False,
-            )
-            if mol is None:
-                return 1
-
-            mol = rdmolops.RemoveHs(mol, updateAtomMap=True)
-            for bond in mol.GetBonds():
-                if (bond.GetBeginAtomIdx() == atom1.get('id') and
-                        bond.GetEndAtomIdx() == atom2.get('id')) or (
-                        bond.GetBeginAtomIdx() == atom2.get('id') and
-                        bond.GetEndAtomIdx() == atom1.get('id')):
-                    return int(bond.GetBondType())
-            return 1
-        except Exception:
-            return 1
+        for bond in self._bonds:
+            if ((bond['from'] == atom1.get('id') and
+                 bond['to'] == atom2.get('id')) or
+                (bond['from'] == atom2.get('id') and
+                 bond['to'] == atom1.get('id'))):
+                return bond['order']
+        return 1
 
     def update_atom_position(
         self,
@@ -156,13 +162,15 @@ class Ligand2DEditor:
         x: float,
         y: float,
     ) -> int:
-        """Add a new atom."""
+        """Add a new atom (no automatic bond perception: partial geometry
+        would yield phantom bonds)."""
         atom_id = max([a['id'] for a in self._atoms], default=0) + 1
 
         self._atoms.append({
             'id': atom_id,
             'name': f"{element}{atom_id}",
             'element': element,
+            'residue_name': 'LIG',
             'x': x,
             'y': y,
             'z': 0.0,
@@ -170,7 +178,6 @@ class Ligand2DEditor:
             'occupancy': 1.0,
         })
 
-        self._infer_bonds()
         return atom_id
 
     def remove_atom(self, atom_id: int):
@@ -182,7 +189,9 @@ class Ligand2DEditor:
         ]
 
     def add_bond(self, from_atom: int, to_atom: int, order: int = 1):
-        """Add a bond between two atoms."""
+        """Add a bond between two atoms (replaces an existing bond on the
+        same pair rather than duplicating it)."""
+        self.remove_bond(from_atom, to_atom)
         self._bonds.append({
             'from': from_atom,
             'to': to_atom,
@@ -237,7 +246,7 @@ class Ligand2DEditor:
             )
             atoms.append(atom)
 
-        ligand = LigandSchema(
+        ligand = Ligand(
             id='edited',
             name='Edited Ligand',
             residue_name='LIG',
@@ -246,12 +255,10 @@ class Ligand2DEditor:
         )
 
         # SDF export uses real editor atom positions when available.
-        # If no atoms are present, fall back to a minimal placeholder only
-        # so the export path itself keeps working.
-        if atoms:
-            return chem.atoms_to_sdf(ligand)
-
-        return chem.smiles_to_sdf('CCO', 'EDITED')
+        # When RDKit cannot build a molecule from the coordinates, the
+        # fallback still writes an atom-only block rather than inventing
+        # a SMILES from local element counts.
+        return chem.atoms_to_sdf(ligand)
 
     def get_2d_coordinates(self) -> List[Tuple[float, float]]:
         """Get 2D coordinates for all atoms."""

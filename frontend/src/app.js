@@ -1,421 +1,32 @@
 /**
- * Ligora App Component
- * Main application shell with scene viewer, panels, and controls
- * FULL PRODUCTION IMPLEMENTATION
+ * Ligora App: binds the static index.html layout to real behavior.
+ *
+ * - 3D viewer: 3Dmol.js rendering the actual structure file delivered by
+ *   the backend (mmCIF/PDB content; no re-fetching from third parties here).
+ * - Panels: ligand card, contacts, evidence, jobs, notes - populated only
+ *   from real backend responses.
+ * - V2 surfaces: batch analysis, water network, 2D ligand editor,
+ *   scripting console and pose comparison - all wired to real backend
+ *   implementations (PLIP, CCD classification, RDKit, live APIs).
  */
 
-import { getCurrentWindow } from '@tauri-apps/api/window'
-import { listen } from '@tauri-apps/api/event'
+import $3Dmol from '3dmol'
+import { open, save } from '@tauri-apps/plugin-dialog'
 import { invoke } from '@tauri-apps/api/core'
-import * as THREE from 'three'
-import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
-import { CSS2DRenderer, CSS2DObject } from 'three/examples/jsm/renderers/CSS2DRenderer.js'
+import { listen } from '@tauri-apps/api/event'
 
-// Color palettes for visualization
 const CHAIN_COLORS = [
-  0x4e79ba, 0xe69f00, 0x56b4e9, 0x009e73, 0xf0e442,
-  0x0072b2, 0xd55e00, 0xcc79a7, 0x999999, 0xe69f00
-];
+  '#4e79ba', '#f28e2b', '#59a14f', '#e15759', '#76b7b2',
+  '#edc948', '#b07aa1', '#ff9da7', '#9c755f', '#bab0ac',
+]
 
-const RESIDUE_COLORS = {};
-// The app does not decide residue chemistry from a hardcoded residue list.
-// Color assignment is a visualization preference only and must not be
-// interpreted as chemical classification. Residue color sets are optional
-// UI state; the authoritative residue identity comes from the structure
-// file and enrichment layer.
-
-export function createApp(options = {}) {
-  const appContainer = document.createElement('div')
-  appContainer.className = 'ligora-app'
-
-  // State
-  const state = {
-    structure: null,
-    selectedLigandId: null,
-    contacts: [],
-    evidence: [],
-    jobs: [],
-    representation: 'cartoon',
-    colorScheme: 'chain',
-    measureMode: false,
-    measuring: false,
-    measurePoints: [],
-    isLoading: false,
-  }
-
-  // Create layout
-  const layout = createLayout()
-  appContainer.appendChild(layout)
-
-  // Create 3D scene
-  const sceneContainer = layout.querySelector('.scene-container')
-  const sceneManager = createScene(sceneContainer, state)
-
-  // Implement controls
-  implementControls(layout, sceneManager, state, options)
-
-  return appContainer
-}
-
-function createLayout() {
-  const layout = document.createElement('div')
-  layout.className = 'ligora-layout'
-  return layout
-}
-
-function createScene(container) {
-  // Three.js scene setup
-  const width = container.clientWidth || 800
-  const height = container.clientHeight || 600
-
-  const scene = new THREE.Scene()
-  scene.background = new THREE.Color(0x1a1a2e)
-
-  // Camera
-  const camera = new THREE.PerspectiveCamera(45, width / height, 0.1, 1000)
-  camera.position.set(15, 10, 20)
-
-  // Renderer
-  const renderer = new THREE.WebGLRenderer({ antialias: true })
-  renderer.setSize(width, height)
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
-  container.appendChild(renderer.domElement)
-
-  // CSS2DRenderer for labels
-  const labelRenderer = new CSS2DRenderer()
-  labelRenderer.setSize(width, height)
-  labelRenderer.domElement.style.position = 'absolute'
-  labelRenderer.domElement.style.top = '0'
-  container.appendChild(labelRenderer.domElement)
-
-  // Controls
-  const controls = new OrbitControls(camera, renderer.domElement)
-  controls.enableDamping = true
-
-  // Lights
-  const ambientLight = new THREE.AmbientLight(0xffffff, 0.6)
-  scene.add(ambientLight)
-
-  const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8)
-  directionalLight.position.set(10, 20, 10)
-  scene.add(directionalLight)
-
-  // Grid helper
-  // const gridHelper = new THREE.GridHelper(50, 10, 0x444444, 0x222222)
-  // scene.add(gridHelper)
-
-  // Handle resize
-  const resizeObserver = new ResizeObserver(() => {
-    const { clientWidth, clientHeight } = container
-    camera.aspect = clientWidth / clientHeight
-    camera.updateProjectionMatrix()
-    renderer.setSize(clientWidth, clientHeight)
-    labelRenderer.setSize(clientWidth, clientHeight)
-  })
-  resizeObserver.observe(container)
-
-  // Animation loop
-  function animate() {
-    requestAnimationFrame(animate)
-    controls.update()
-    renderer.render(scene, camera)
-    labelRenderer.render(scene, camera)
-  }
-  animate()
-
-  return {
-    scene,
-    camera,
-    renderer,
-    labelRenderer,
-    controls,
-  }
-}
-
-function createRightPanel() {
-  const panel = document.createElement('div')
-  panel.className = 'right-panel'
-  panel.innerHTML = `
-    <div class="panel-section">
-      <h3>Ligand Card</h3>
-      <div class="ligand-card">
-        <div class="ligand-placeholder">
-          Select a structure to view ligand info
-        </div>
-      </div>
-    </div>
-
-    <div class="panel-section">
-      <h3>Contacts</h3>
-      <div class="contacts-table">
-        <div class="contacts-placeholder">
-          Run contact analysis to see interactions
-        </div>
-      </div>
-    </div>
-
-    <div class="panel-section">
-      <h3>Evidence</h3>
-      <div class="evidence-pane">
-        <div class="evidence-placeholder">
-          Ligand enrichment data will appear here
-        </div>
-      </div>
-    </div>
-
-    <div class="panel-section">
-      <h3>Jobs</h3>
-      <div class="jobs-pane">
-        <div class="jobs-placeholder">
-          No running jobs
-        </div>
-      </div>
-    </div>
-
-    <div class="panel-section">
-      <h3>Notes</h3>
-      <textarea class="notes-area" placeholder="Add notes about this analysis..." rows="4"></textarea>
-    </div>
-  `
-
-  // Bind panel update helpers to this panel instance
-  panel.querySelector('.ligand-card')._update = updateLigandCard
-  panel.querySelector('.contacts-table')._update = updateContactsPanel
-  panel.querySelector('.evidence-pane')._update = updateEvidencePanel
-  panel.querySelector('.jobs-pane')._update = updateJobsPanel
-
-  return panel
-}
-
-function createTopBar() {
-  const topBar = document.createElement('div')
-  topBar.className = 'top-bar'
-  topBar.innerHTML = `
-    <div class="logo">
-      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-        <circle cx="12" cy="12" r="3"/>
-        <circle cx="19" cy="5" r="2"/>
-        <circle cx="5" cy="19" r="2"/>
-        <path d="M12 9v3l2 2"/>
-      </svg>
-      <span>Ligora</span>
-    </div>
-
-    <div class="menu-group">
-      <button class="btn btn-secondary" id="btn-open-file">
-        Open File
-      </button>
-      <button class="btn btn-secondary" id="btn-open-pdb">
-        Open PDB ID
-      </button>
-    </div>
-
-    <div class="menu-group">
-      <select id="select-representation" class="select">
-        <option value="cartoon">Cartoon</option>
-        <option value="stick">Stick</option>
-        <option value="sphere">Sphere</option>
-        <option value="surface">Surface</option>
-        <option value="line">Line</option>
-      </select>
-
-      <select id="select-colorscheme" class="select">
-        <option value="chain">By Chain</option>
-        <option value="residue">By Residue</option>
-        <option value="atomindex">By Atom Index</option>
-        <option value="electrostatic">Electrostatic</option>
-      </select>
-    </div>
-
-    <div class="menu-group">
-      <button class="btn btn-secondary" id="btn-measure">
-        Measure
-      </button>
-      <button class="btn btn-primary" id="btn-run-analysis">
-        Run Analysis
-      </button>
-      <button class="btn btn-secondary" id="btn-get-status">
-        Refresh Status
-      </button>
-    </div>
-  `
-  return topBar
-}
-
-function implementControls(layout, scene, state, options) {
-  // Open file button
-  const openFileBtn = layout.querySelector('#btn-open-file')
-  if (openFileBtn) {
-    openFileBtn.addEventListener('click', async () => {
-      try {
-        const { open } = await import('@tauri-apps/plugin-dialog')
-        const selected = await open({
-          multiple: false,
-          filters: [{
-            name: 'Structure Files',
-            extensions: ['pdb', 'cif', 'mmcif', 'bcif', 'sdf', 'mol']
-          }]
-        })
-
-        if (selected) {
-          // Send to backend for parsing
-          if (options.onStructureLoaded) {
-            await options.onStructureLoaded({ file_path: selected })
-          }
-        }
-      } catch (error) {
-        console.error('Error opening file:', error)
-      }
-    })
-  }
-
-  // Open PDB ID button
-  const openPdbBtn = layout.querySelector('#btn-open-pdb')
-  if (openPdbBtn) {
-    openPdbBtn.addEventListener('click', async () => {
-      const pdbId = prompt('Enter PDB ID (e.g., 1ABC):')
-      if (pdbId) {
-        if (options.onStructureLoaded) {
-          await options.onStructureLoaded({ pdb_id: pdbId.toUpperCase() })
-        }
-      }
-    })
-  }
-
-  // Representation selector
-  const repSelect = layout.querySelector('#select-representation')
-  if (repSelect) {
-    repSelect.addEventListener('change', (e) => {
-      state.representation = e.target.value
-      // Update scene visualization
-      updateRepresentation(scene, state.representation)
-    })
-  }
-
-  // Color scheme selector
-  const colorSelect = layout.querySelector('#select-colorscheme')
-  if (colorSelect) {
-    colorSelect.addEventListener('change', (e) => {
-      state.colorScheme = e.target.value
-      updateColorScheme(scene, state.colorScheme)
-    })
-  }
-
-  // Run analysis button
-  const runBtn = layout.querySelector('#btn-run-analysis')
-  if (runBtn) {
-    runBtn.addEventListener('click', async () => {
-      runBtn.disabled = true
-      runBtn.textContent = 'Running...'
-
-      try {
-        if (options.onRunContactAnalysis) {
-          const result = await options.onRunContactAnalysis()
-          if (result) {
-            state.contacts = result.contacts || []
-            updateContactsPanel(result)
-            if (result.ligand_resolved) {
-              state.selectedLigand = result.ligand_resolved
-              updateLigandCard(result.ligand_resolved)
-            } else if (result.ligand) {
-              state.selectedLigand = result.ligand
-              updateLigandCard(result.ligand)
-            }
-            if (result.evidence) {
-              state.evidence = result.evidence
-              updateEvidencePanel(result.evidence)
-            }
-          }
-        }
-      } catch (error) {
-        console.error('Analysis error:', error)
-      } finally {
-        runBtn.disabled = false
-        runBtn.textContent = 'Run Analysis'
-      }
-    })
-  }
-
-  // Measure button
-  const measureBtn = layout.querySelector('#btn-measure')
-  if (measureBtn) {
-    measureBtn.addEventListener('click', () => {
-      state.measureMode = !state.measureMode
-      measureBtn.classList.toggle('active', state.measureMode)
-      measureBtn.textContent = state.measureMode ? 'Measuring...' : 'Measure'
-    })
-  }
-
-  // Status refresh button
-  const statusSel = layout.querySelector('#btn-get-status')
-  if (statusSel) {
-    statusSel.addEventListener('click', async () => {
-      try {
-        if (options.onGetStatus) {
-          const status = await options.onGetStatus()
-          updateJobsPanel(status)
-        }
-      } catch (error) {
-        console.error('Status error:', error)
-      }
-    })
-  }
-}
-
-function updateRepresentation(scene, representation) {
-  // In a full implementation, this would update the 3Dmol.js viewer
-  // For Three.js, we'd update the geometry rendering mode
-  console.log('Representation changed to:', representation)
-}
-
-function updateColorScheme(scene, colorScheme) {
-  console.log('Color scheme changed to:', colorScheme)
-}
-
-function updateContactsPanel(result) {
-  const panel = document.querySelector('.right-panel')
-  if (!panel) return
-
-  const contactsSection = panel.querySelector('.contacts-table')
-  if (!contactsSection) return
-
-  if (!result || !result.contacts || result.contacts.length === 0) {
-    contactsSection.innerHTML = `
-      <div class="contacts-placeholder">
-        No contacts found
-      </div>
-    `
-    return
-  }
-
-  let html = '<table><thead><tr>'
-  html += '<th>Type</th>'
-  html += '<th>Protein</th>'
-  html += '<th>Ligand</th>'
-  html += '<th>Distance</th>'
-  html += '</tr></thead><tbody>'
-
-  result.contacts.slice(0, 50).forEach(c => {
-    const typeClass = (c.contact_type || 'unknown').replace(/_/g, '-')
-    html += `<tr class="contact-row">`
-    html += `<td><span class="contact-badge ${typeClass}">${escapeHtml(c.contact_type || 'unknown')}</span></td>`
-    html += `<td>${escapeHtml(c.protein_residue_name || '')}${escapeHtml(String(c.protein_residue_id || ''))} (${escapeHtml(c.protein_chain_id || '')})</td>`
-    html += `<td>${escapeHtml(c.ligand_residue_name || '')}${escapeHtml(String(c.ligand_residue_id || ''))}</td>`
-    html += `<td>${c.distance != null ? Number(c.distance).toFixed(2) : '—'} Å</td>`
-    html += `</tr>`
-  })
-
-  html += '</tbody></table>'
-
-  if (result.contacts.length > 50) {
-    html += `<div class="contacts-more">... and ${result.contacts.length - 50} more</div>`
-  }
-
-  contactsSection.innerHTML = html
+const ELEMENT_COLORS = {
+  H: '#e6e6e6', C: '#4ecdc4', N: '#58a6ff', O: '#ff6b6b',
+  S: '#edc948', P: '#f28e2b', F: '#9ce0e0', CL: '#59a14f', BR: '#a371f7',
 }
 
 function escapeHtml(s) {
-  return String(s)
+  return String(s ?? '')
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
@@ -423,136 +34,1064 @@ function escapeHtml(s) {
     .replace(/'/g, '&#39;')
 }
 
-function updateLigandCard(ligand) {
-  const card = document.querySelector('.ligand-card')
-  if (!card) return
-
-  const hintClass =
-    ligand.classification_hint === 'solvent' ? 'solvent' :
-    ligand.classification_hint === 'ion' ? 'ion' :
-    ligand.classification_hint === 'small-molecule' ? 'small-molecule' :
-    ligand.classification_hint === 'cofactor' ? 'cofactor' :
-    'unknown'
-
-  card.innerHTML = `
-    <div class="ligand-header">
-      <span class="ligand-name">${escapeHtml(ligand.name || ligand.residue_name || 'Unknown')}</span>
-      <span class="ligand-badge ${hintClass}">${escapeHtml(ligand.classification_hint || 'unclassified')}</span>
-    </div>
-    <div class="ligand-properties">
-      <div class="ligand-property">
-        <div class="ligand-property-label">Formula</div>
-        <div class="ligand-property-value">${ligand.formula ? escapeHtml(ligand.formula) : '—'}</div>
-      </div>
-      <div class="ligand-property">
-        <div class="ligand-property-label">MW</div>
-        <div class="ligand-property-value">${ligand.molecular_weight != null ? Number(ligand.molecular_weight).toFixed(2) : '—'}</div>
-      </div>
-      <div class="ligand-property">
-        <div class="ligand-property-label">SMILES</div>
-        <div class="ligand-property-value">${ligand.smiles ? escapeHtml(ligand.smiles) : '—'}</div>
-      </div>
-      <div class="ligand-property">
-        <div class="ligand-property-label">InChI Key</div>
-        <div class="ligand-property-value">${ligand.inchi_key ? escapeHtml(ligand.inchi_key) : '—'}</div>
-      </div>
-      <div class="ligand-property">
-        <div class="ligand-property-label">IUPAC</div>
-        <div class="ligand-property-value">${ligand.iupac_name ? escapeHtml(ligand.iupac_name) : '—'}</div>
-      </div>
-      <div class="ligand-property">
-        <div class="ligand-property-label">PubChem CID</div>
-        <div class="ligand-property-value">${ligand.pubchem_cid ? String(ligand.pubchem_cid) : '—'}</div>
-      </div>
-      <div class="ligand-property">
-        <div class="ligand-property-label">ChEMBL ID</div>
-        <div class="ligand-property-value">${ligand.chembl_id ? escapeHtml(ligand.chembl_id) : '—'}</div>
-      </div>
-      <div class="ligand-property">
-        <div class="ligand-property-label">Resolution</div>
-        <div class="ligand-property-value">${escapeHtml(ligand.resolution_status || '—')}</div>
-      </div>
-    </div>
-  `
-}
-
-function updateEvidencePanel(evidence) {
-  const panel = document.querySelector('.evidence-pane')
-  if (!panel) return
-
-  if (!evidence || evidence.length === 0) {
-    panel.innerHTML = `
-      <div class="evidence-placeholder">
-        No enrichment evidence available
-      </div>
-    `
-    return
+export function createApp({ sendCommand }) {
+  const state = {
+    structure: null,
+    selectedLigandId: null,
+    selectedLigand: null,
+    contacts: [],
+    representation: 'cartoon',
+    colorScheme: 'chain',
+    measureMode: false,
+    picks: [],
   }
 
-  let html = ''
-  evidence.forEach(e => {
-    const val = typeof e.value === 'object' ? JSON.stringify(e.value, null, 2) : String(e.value)
-    html += `<div class="evidence-item">
-      <div class="evidence-source">${escapeHtml(e.source)}</div>
-      <div class="evidence-value">${escapeHtml(val)}</div>
-      ${e.url ? `<div class="evidence-url">${escapeHtml(e.url)}</div>` : ''}
+  let viewer = null
+  let viewerElement = null
+
+  const el = (id) => document.getElementById(id)
+
+  // ------------------------------------------------------------------
+  // Status toast
+  // ------------------------------------------------------------------
+
+  function showStatus(message, isError = false) {
+    let toast = el('status-toast')
+    if (!toast) {
+      toast = document.createElement('div')
+      toast.id = 'status-toast'
+      document.body.appendChild(toast)
+    }
+    toast.textContent = message
+    toast.className = isError ? 'status-toast error' : 'status-toast'
+    toast.style.display = 'block'
+    clearTimeout(toast._timer)
+    toast._timer = setTimeout(() => { toast.style.display = 'none' }, 4000)
+  }
+
+  function setBusy(busy, text = 'Loading...') {
+    const overlay = el('loading-overlay')
+    if (overlay) {
+      overlay.style.display = busy ? 'flex' : 'none'
+      const label = overlay.querySelector('.loading-text')
+      if (label) label.textContent = text
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // 3D viewer (3Dmol.js)
+  // ------------------------------------------------------------------
+
+  function initViewer() {
+    viewerElement = el('scene-container')
+    if (!viewerElement || viewer) return
+    viewer = $3Dmol.createViewer(viewerElement, {
+      backgroundColor: '#1a1a2e',
+      callback: onAtomPicked,
+    })
+    const ro = new ResizeObserver(() => {
+      if (viewer) viewer.resize()
+    })
+    ro.observe(viewerElement)
+  }
+
+  async function loadStructureIntoViewer() {
+    if (!viewer) return
+    const file = await sendCommand('get_structure_file', {})
+    viewer.clear()
+    viewer.addModel(file.content, file.format === 'pdb' ? 'pdb' : 'cif')
+    applyView()
+    viewer.zoomTo()
+    viewer.render()
+  }
+
+  function proteinStyle() {
+    const clickable = state.measureMode ? { clickable: true } : {}
+    const sel = { not: { elem: 'H' } }
+    switch (state.representation) {
+      case 'stick':
+        return [{ sel, style: { stick: { radius: 0.25, ...clickable } } }]
+      case 'sphere':
+        return [{ sel, style: { sphere: { scale: 0.4, ...clickable } } }]
+      case 'line':
+        return [{ sel, style: { line: { ...clickable } } }]
+      case 'licorice':
+        return [{ sel, style: { stick: { radius: 0.12, ...clickable } } }]
+      case 'surface':
+        return [{ sel, style: { cartoon: { color: 'spectrum', ...clickable } } }]
+      case 'cartoon':
+      default:
+        return [{ sel, style: { cartoon: { color: 'spectrum', ...clickable } } }]
+    }
+  }
+
+  function chainStyle() {
+    // Real per-chain colors from the backend structure's chain list.
+    const clickable = state.measureMode ? { clickable: true } : {}
+    const chains = (state.structure?.chains || []).filter(c => c.is_polymer)
+    const styles = chains.map((chain, i) => ({
+      sel: { chain: chain.id, not: { elem: 'H' } },
+      style: {
+        cartoon: { color: CHAIN_COLORS[i % CHAIN_COLORS.length], ...clickable },
+        stick: { color: CHAIN_COLORS[i % CHAIN_COLORS.length], ...clickable },
+      },
+    }))
+    if (styles.length === 0) {
+      return [{ sel: { not: { elem: 'H' } }, style: { cartoon: { color: '#4e79ba', ...clickable } } }]
+    }
+    return styles
+  }
+
+  function applyView() {
+    if (!viewer) return
+    viewer.removeAllSurfaces()
+    const styles = state.colorScheme === 'chain' ? chainStyle() : proteinStyle()
+    for (const { sel, style } of styles) {
+      viewer.setStyle(sel, style)
+    }
+    if (state.representation === 'surface') {
+      const type = $3Dmol.SurfaceType ? $3Dmol.SurfaceType.VDW : 'VDW'
+      viewer.addSurface(type, { opacity: 0.75 }, { not: { elem: 'H' } })
+    }
+    // Ligand always visible as sticks + spheres, highlighted when selected.
+    const ligSel = state.selectedLigand
+      ? { resn: state.selectedLigand.residue_name }
+      : null
+    if (ligSel) {
+      viewer.addStyle(ligSel, {
+        stick: { radius: 0.3, color: '#4ecdc4' },
+        sphere: { scale: 0.35, color: '#4ecdc4' },
+      })
+    }
+    // Contacted protein residues highlighted from real PLIP results.
+    for (const c of state.contacts) {
+      viewer.addStyle(
+        { chain: c.protein_chain_id, resi: c.protein_residue_id },
+        { stick: { radius: 0.28, color: '#ff6b6b' } })
+    }
+    viewer.render()
+  }
+
+  // ------------------------------------------------------------------
+  // Measurement (real coordinates via backend math)
+  // ------------------------------------------------------------------
+
+  function onAtomPicked(atom) {
+    if (!state.measureMode || !atom) return
+    state.picks.push({
+      chain: atom.chain,
+      residue_id: atom.resi,
+      residue_name: atom.resn,
+      name: atom.name,
+      x: atom.x, y: atom.y, z: atom.z,
+    })
+    if (state.picks.length > 3) state.picks = state.picks.slice(-3)
+    updateMeasureOverlay()
+    if (state.picks.length === 2) {
+      measure('measure_distance', 'distance')
+    } else if (state.picks.length === 3) {
+      measure('measure_angle', 'angle')
+    }
+  }
+
+  async function measure(command, field) {
+    try {
+      const refs = state.picks.map(p => ({
+        chain: p.chain, residue_id: p.residue_id, name: p.name,
+      }))
+      const payload = command === 'measure_distance'
+        ? { atom1: refs[0], atom2: refs[1] }
+        : { atom1: refs[0], atom2: refs[1], atom3: refs[2] }
+      const result = await sendCommand(command, payload)
+      updateMeasureOverlay(result[field])
+    } catch (e) {
+      showStatus(`Measurement failed: ${e.message}`, true)
+    }
+  }
+
+  function updateMeasureOverlay(value) {
+    let overlay = el('measure-overlay')
+    if (!overlay) {
+      overlay = document.createElement('div')
+      overlay.id = 'measure-overlay'
+      viewerElement?.appendChild(overlay)
+    }
+    const labels = state.picks.map(p =>
+      `${escapeHtml(p.chain || '?')}:${p.residue_id ?? '?'}:${escapeHtml(p.name || '?')}`)
+    overlay.innerHTML = `
+      <div class="measure-points">${labels.map(l => `<span>${l}</span>`).join(' → ')}</div>
+      ${value != null
+        ? `<div class="measure-result">${Number(value).toFixed(3)}
+           ${state.picks.length === 3 ? '°' : ' Å'}</div>`
+        : '<div class="measure-result">pick 1 more atom</div>'}
+    `
+  }
+
+  // ------------------------------------------------------------------
+  // Panels
+  // ------------------------------------------------------------------
+
+  function updateLigandSelect() {
+    const select = el('ligand-select')
+    if (!select) return
+    const ligands = state.structure?.ligands || []
+    const seen = new Set()
+    select.innerHTML = ''
+    for (const lig of ligands) {
+      const key = `${lig.residue_name}:${lig.id}`
+      if (seen.has(lig.residue_name)) continue
+      seen.add(lig.residue_name)
+      const opt = document.createElement('option')
+      opt.value = lig.id
+      opt.textContent = `${lig.residue_name} (${lig.name || ''})`
+      select.appendChild(opt)
+    }
+    if (state.selectedLigandId) select.value = state.selectedLigandId
+  }
+
+  function updateLigandCard(ligand) {
+    const card = el('ligand-card')
+    if (!card || !ligand) return
+    card.innerHTML = `
+      <div class="ligand-header">
+        <span class="ligand-name">${escapeHtml(ligand.name || ligand.residue_name)}</span>
+        <span class="ligand-badge">${escapeHtml(ligand.classification_hint || 'unclassified')}</span>
+      </div>
+      <div class="ligand-properties">
+        ${ligandRow('Formula', ligand.formula)}
+        ${ligandRow('MW', ligand.molecular_weight != null ? Number(ligand.molecular_weight).toFixed(2) : null)}
+        ${ligandRow('SMILES', ligand.smiles)}
+        ${ligandRow('InChI Key', ligand.inchi_key)}
+        ${ligandRow('IUPAC', ligand.iupac_name)}
+        ${ligandRow('PubChem CID', ligand.pubchem_cid ? String(ligand.pubchem_cid) : null)}
+        ${ligandRow('ChEMBL', ligand.chembl_id)}
+        ${ligandRow('Status', ligand.resolution_status)}
+      </div>`
+  }
+
+  function ligandRow(label, value) {
+    return `<div class="ligand-property">
+      <div class="ligand-property-label">${escapeHtml(label)}</div>
+      <div class="ligand-property-value">${value ? escapeHtml(value) : '—'}</div>
     </div>`
-  })
-  panel.innerHTML = html
-}
-
-function updateJobsPanel(statusOrResult) {
-  const pane = document.querySelector('.jobs-pane')
-  if (!pane) return
-
-  if (!statusOrResult) {
-    pane.innerHTML = `
-      <div class="jobs-placeholder">
-        No running jobs
-      </div>
-    `
-    return
   }
 
-  const jobs = Array.isArray(statusOrResult.jobs) ? statusOrResult.jobs : []
-  const engines = statusOrResult.engines
+  function updateContactsPanel(contacts, plipAvailable) {
+    const pane = el('contacts-table')
+    if (!pane) return
+    if (!contacts || contacts.length === 0) {
+      pane.innerHTML = `<div class="contacts-placeholder">${
+        plipAvailable === false
+          ? 'PLIP is not installed - contact analysis unavailable'
+          : 'No contacts found'}</div>`
+      return
+    }
+    let html = '<table><thead><tr><th>Type</th><th>Protein</th><th>Lig atom</th><th>Å</th></tr></thead><tbody>'
+    for (const c of contacts.slice(0, 100)) {
+      html += `<tr class="contact-row" data-chain="${escapeHtml(c.protein_chain_id)}" data-resi="${escapeHtml(String(c.protein_residue_id))}">
+        <td><span class="contact-badge">${escapeHtml(c.contact_type || '')}</span></td>
+        <td>${escapeHtml(c.protein_residue_name)}${escapeHtml(String(c.protein_residue_id))} (${escapeHtml(c.protein_chain_id)})</td>
+        <td>${escapeHtml(c.ligand_atom || '')}</td>
+        <td>${c.distance != null ? Number(c.distance).toFixed(2) : '—'}</td>
+      </tr>`
+    }
+    html += '</tbody></table>'
+    if (contacts.length > 100) {
+      html += `<div class="contacts-more">... and ${contacts.length - 100} more</div>`
+    }
+    pane.innerHTML = html
+    pane.querySelectorAll('.contact-row').forEach(row => {
+      row.addEventListener('click', () => {
+        if (!viewer) return
+        viewer.zoomTo({
+          chain: row.dataset.chain,
+          resi: parseInt(row.dataset.resi, 10),
+        })
+        viewer.render()
+      })
+    })
+  }
 
-  let html = ''
-  if (engines && typeof engines === 'object') {
-    html += `<div class="jobs-section">
-      <div class="jobs-section-title">Engines</div>
-      <div class="jobs-list">`
+  function updateEvidencePanel(evidence) {
+    const pane = el('evidence-pane')
+    if (!pane) return
+    if (!evidence || evidence.length === 0) {
+      pane.innerHTML = '<div class="evidence-placeholder">No enrichment evidence available</div>'
+      return
+    }
+    pane.innerHTML = evidence.map(e => {
+      const val = typeof e.value === 'object' && e.value !== null
+        ? JSON.stringify(e.value) : String(e.value ?? '')
+      return `<div class="evidence-item">
+        <div class="evidence-source">${escapeHtml(e.source)}</div>
+        <div class="evidence-value">${escapeHtml(val)}</div>
+        ${e.url ? `<a class="evidence-url" href="${escapeHtml(e.url)}" target="_blank" rel="noopener">${escapeHtml(e.url)}</a>` : ''}
+      </div>`
+    }).join('')
+  }
+
+  function updateJobsPanel(status) {
+    const pane = el('jobs-pane')
+    if (!pane) return
+    if (!status) {
+      pane.innerHTML = '<div class="jobs-placeholder">No running jobs</div>'
+      return
+    }
+    let html = ''
+    const engines = status.engines || {}
+    html += '<div class="jobs-section"><div class="jobs-section-title">Engines</div><div class="jobs-list">'
     for (const [name, info] of Object.entries(engines)) {
-      const available = info && info.available === true
+      const ok = info && info.available === true
       html += `<div class="job-item">
-        <span class="job-status ${available ? 'completed' : 'failed'}"></span>
+        <span class="job-status ${ok ? 'completed' : 'failed'}"></span>
         <span>${escapeHtml(name)}</span>
-        <span class="job-detail">${available ? 'available' : 'not available'}</span>
+        <span class="job-detail">${ok ? 'available' : 'not installed'}</span>
       </div>`
     }
-    html += `</div></div>`
+    html += '</div></div>'
+    const sources = status.data_sources || {}
+    const sourceNames = Object.keys(sources)
+    if (sourceNames.length > 0) {
+      html += '<div class="jobs-section"><div class="jobs-section-title">Data sources</div><div class="jobs-list">'
+      for (const [name, st] of Object.entries(sources)) {
+        html += `<div class="job-item">
+          <span class="job-status ${st === 'ok' ? 'completed' : 'failed'}"></span>
+          <span>${escapeHtml(name)}</span>
+          <span class="job-detail">${escapeHtml(st)}</span>
+        </div>`
+      }
+      html += '</div></div>'
+    }
+    pane.innerHTML = html
   }
 
-  if (jobs && jobs.length > 0) {
-    html += `<div class="jobs-section">
-      <div class="jobs-section-title">Jobs</div>
-      <div class="jobs-list">`
-    jobs.forEach(j => {
-      const statusClass = j.status || 'pending'
-      html += `<div class="job-item">
-        <span class="job-status ${statusClass}"></span>
-        <span>${escapeHtml(j.id || '')}</span>
-        <span class="job-detail">${escapeHtml(statusClass)}</span>
-      </div>`
+  function showJobResult(job) {
+    const pane = el('jobs-pane')
+    if (!pane || !job) return
+    const poses = job.result?.poses || []
+    if (poses.length > 0) {
+      const rows = poses.map(p =>
+        `<div class="job-item"><span class="job-status completed"></span>
+         <span>pose ${p.pose_id}</span>
+         <span class="job-detail">${Number(p.affinity).toFixed(2)} kcal/mol</span></div>`).join('')
+      pane.insertAdjacentHTML('beforeend',
+        `<div class="jobs-section"><div class="jobs-section-title">Docking poses</div><div class="jobs-list">${rows}</div></div>`)
+    } else if (job.error) {
+      showStatus(`Job failed: ${job.error}`, true)
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Actions
+  // ------------------------------------------------------------------
+
+  async function openLocalFile() {
+    const selected = await open({
+      multiple: false,
+      filters: [{ name: 'Structure files', extensions: ['cif', 'mmcif', 'cif.gz', 'pdb', 'ent'] }],
     })
-    html += `</div></div>`
+    if (!selected) return
+    setBusy(true, 'Opening file...')
+    try {
+      const data = await sendCommand('open_local_file', { file_path: selected })
+      await onStructureLoaded(data)
+    } catch (e) {
+      showStatus(`Failed to open file: ${e.message}`, true)
+    } finally {
+      setBusy(false)
+    }
   }
 
-  if (!html) {
-    html = `<div class="jobs-placeholder">
-      No running jobs
-    </div>`
+  /** Real in-app modal prompt (no browser prompt dialogs). */
+  function appPrompt(title, placeholder) {
+    return new Promise((resolve) => {
+      let modal = el('app-modal')
+      if (!modal) {
+        modal = document.createElement('div')
+        modal.id = 'app-modal'
+        modal.className = 'modal-backdrop'
+        document.body.appendChild(modal)
+      }
+      modal.innerHTML = `
+        <div class="modal">
+          <div class="modal-title">${escapeHtml(title)}</div>
+          <input class="input modal-input" id="modal-input"
+              placeholder="${escapeHtml(placeholder || '')}" autocomplete="off">
+          <div class="modal-actions">
+            <button class="btn btn-secondary" id="modal-cancel">Cancel</button>
+            <button class="btn btn-primary" id="modal-ok">Open</button>
+          </div>
+        </div>`
+      modal.style.display = 'flex'
+      const input = el('modal-input')
+      input.focus()
+      const close = (value) => {
+        modal.style.display = 'none'
+        modal.innerHTML = ''
+        document.removeEventListener('keydown', onKey)
+        resolve(value)
+      }
+      const onKey = (e) => {
+        if (e.key === 'Enter') close(input.value.trim())
+        if (e.key === 'Escape') close(null)
+      }
+      document.addEventListener('keydown', onKey)
+      el('modal-cancel').addEventListener('click', () => close(null))
+      el('modal-ok').addEventListener('click', () => close(input.value.trim()))
+      modal.addEventListener('mousedown', (e) => {
+        if (e.target === modal) close(null)
+      })
+    })
   }
 
-  pane.innerHTML = html
+  async function openPdbId() {
+    const pdbId = await appPrompt('Open PDB ID from RCSB', 'e.g. 3W85')
+    if (!pdbId) return
+    if (!/^[0-9][A-Za-z0-9]{3}$/.test(pdbId)) {
+      showStatus('Invalid PDB ID format (expect 4 characters, e.g. 3W85)', true)
+      return
+    }
+    setBusy(true, `Fetching ${pdbId.toUpperCase()} from RCSB...`)
+    try {
+      const data = await sendCommand('open_pdb_id', { pdb_id: pdbId.trim().toUpperCase() })
+      await onStructureLoaded(data)
+    } catch (e) {
+      showStatus(`Failed to open ${pdbId.toUpperCase()}: ${e.message}`, true)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function onStructureLoaded(data) {
+    state.structure = data.structure
+    state.contacts = []
+    state.selectedLigand = null
+    state.selectedLigandId = null
+    state.picks = []
+    updateLigandSelect()
+    updateContactsPanel([], true)
+    updateEvidencePanel([])
+    await loadStructureIntoViewer()
+    // Auto-select the first ligand that is not solvent/ion per its CCD class.
+    const first = (state.structure.ligands || []).find(
+      l => l.classification_hint && !['HETAS', 'HETAI'].includes(l.classification_hint))
+      || (state.structure.ligands || [])[0]
+    if (first) await selectLigand(first.id)
+    showStatus(`Loaded ${state.structure.id}`)
+  }
+
+  async function selectLigand(ligandId) {
+    state.selectedLigandId = ligandId
+    try {
+      const data = await sendCommand('select_ligand', { ligand_id: ligandId })
+      state.selectedLigand = data.ligand
+      updateLigandCard(data.ligand)
+      updateLigandSelect()
+      applyView()
+    } catch (e) {
+      showStatus(`Ligand selection failed: ${e.message}`, true)
+    }
+  }
+
+  async function runAnalysis() {
+    setBusy(true, 'Running PLIP contact analysis...')
+    try {
+      const data = await sendCommand('run_contact_analysis', {})
+      state.contacts = data.contacts || []
+      if (data.ligand) state.selectedLigand = data.ligand
+      updateContactsPanel(data.contacts, data.plip_available)
+      if (data.ligand) updateLigandCard(data.ligand)
+      updateEvidencePanel(data.evidence)
+      applyView()
+      showStatus(`${data.contact_count} contacts found (PLIP)`)
+    } catch (e) {
+      showStatus(`Analysis failed: ${e.message}`, true)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function refreshStatus() {
+    try {
+      const status = await sendCommand('get_status', {})
+      updateJobsPanel(status)
+    } catch (e) {
+      showStatus(`Status failed: ${e.message}`, true)
+    }
+  }
+
+  async function exportArtifacts() {
+    if (!state.structure) {
+      showStatus('Open a structure first', true)
+      return
+    }
+    try {
+      const saved = await sendCommand('save_artifact', {})
+      const dest = await save({
+        defaultPath: `analysis_${state.structure.id}.json`,
+        filters: [{ name: 'JSON', extensions: ['json'] }],
+      })
+      if (dest) {
+        await invoke('copy_file', { src: saved.path, dest })
+      }
+      try {
+        const sdf = await sendCommand('export_ligand_sdf', {})
+        const sdfDest = await save({
+          defaultPath: `ligand_${state.selectedLigand?.residue_name || 'ligand'}.sdf`,
+          filters: [{ name: 'SDF', extensions: ['sdf'] }],
+        })
+        if (sdfDest) {
+          await invoke('copy_file', { src: sdf.path, dest: sdfDest })
+        }
+      } catch (e) {
+        showStatus(`SDF export skipped: ${e.message}`, true)
+      }
+      showStatus('Export complete')
+    } catch (e) {
+      showStatus(`Export failed: ${e.message}`, true)
+    }
+  }
+
+  function toggleMeasure() {
+    state.measureMode = !state.measureMode
+    if (!state.measureMode) {
+      state.picks = []
+      updateMeasureOverlay(null)
+      const overlay = el('measure-overlay')
+      if (overlay) overlay.style.display = 'none'
+    } else if (overlay) {
+      overlay.style.display = 'block'
+    }
+    const btn = el('btn-measure')
+    if (btn) btn.classList.toggle('active', state.measureMode)
+    applyView()
+  }
+
+  // ==================================================================
+  // V2: batch analysis
+  // ==================================================================
+
+  let lastBatchId = null
+
+  async function runBatch() {
+    const raw = el('batch-sources')?.value || ''
+    const sources = raw.split(',').map(s => s.trim()).filter(Boolean)
+    if (sources.length === 0) {
+      showStatus('Enter at least one PDB ID or file path', true)
+      return
+    }
+    const sourceType = sources.every(s => /^[0-9][a-z0-9]{3}$/i.test(s))
+      ? 'pdb_id' : 'local'
+    setBusy(true, 'Running batch analysis (PLIP + live enrichment)...')
+    try {
+      const added = await sendCommand('batch_add', { sources, source_type: sourceType })
+      lastBatchId = added.batch_id
+      const summary = await sendCommand('batch_run', { batch_id: added.batch_id })
+      renderBatchResults(summary)
+      showStatus(`Batch done: ${summary.succeeded}/${summary.total} succeeded`)
+    } catch (e) {
+      showStatus(`Batch failed: ${e.message}`, true)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  function renderBatchResults(summary) {
+    const pane = el('batch-results')
+    if (!pane) return
+    let html = `<div class="v2-summary">${summary.succeeded} succeeded / ${summary.failed} failed of ${summary.total}</div>`
+    html += '<table><thead><tr><th>Structure</th><th>Ligand</th><th>Contacts</th><th></th></tr></thead><tbody>'
+    for (const r of summary.results || []) {
+      html += `<tr>
+        <td>${escapeHtml(String(r.structure_id || ''))}</td>
+        <td>${escapeHtml(r.ligand_name || '—')}</td>
+        <td>${r.contact_count != null ? String(r.contact_count) : '—'}</td>
+        <td>${r.success
+          ? '<span class="job-status completed"></span>'
+          : `<span class="job-status failed"></span><span class="v2-error" title="${escapeHtml(r.error || '')}">failed</span>`}</td>
+      </tr>`
+    }
+    html += '</tbody></table>'
+    pane.innerHTML = html
+  }
+
+  async function exportBatch() {
+    if (!lastBatchId) {
+      showStatus('Run a batch first', true)
+      return
+    }
+    try {
+      const result = await sendCommand('batch_export', { batch_id: lastBatchId })
+      const dest = await save({
+        defaultPath: 'batch_results',
+        filters: [{ name: 'Directory', extensions: ['*'] }],
+      })
+      if (dest) {
+        await invoke('copy_file', { src: result.path, dest })
+      }
+      showStatus(`Batch exported: ${result.path}`)
+    } catch (e) {
+      showStatus(`Batch export failed: ${e.message}`, true)
+    }
+  }
+
+  // ==================================================================
+  // V2: water network
+  // ==================================================================
+
+  async function analyzeWaterNetwork() {
+    if (!state.structure) {
+      showStatus('Open a structure first', true)
+      return
+    }
+    setBusy(true, 'Analyzing water network...')
+    try {
+      const data = await sendCommand('analyze_water_network', {})
+      renderWaterNetwork(data)
+      showStatus(`${data.water_count} waters, ${data.network.length} network edges`)
+    } catch (e) {
+      showStatus(`Water analysis failed: ${e.message}`, true)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  function renderWaterNetwork(data) {
+    const pane = el('water-results')
+    if (!pane) return
+    let html = `<div class="v2-summary">${data.water_count} waters · ${data.network.length} water-water edges · ${data.water_contacts.length} water-protein contacts</div>`
+    // Clusters
+    if (data.clusters.length > 0) {
+      html += `<div class="v2-section-title">Clusters</div><div class="v2-chips">`
+      for (const c of data.clusters.slice(0, 20)) {
+        html += `<span class="v2-chip">cluster of ${c.size}</span>`
+      }
+      html += '</div>'
+    }
+    // Nearest protein contacts (real distances from the structure)
+    html += '<div class="v2-section-title">Water-protein contacts (nearest)</div>'
+    html += '<table><thead><tr><th>Water</th><th>Protein atom</th><th>Å</th></tr></thead><tbody>'
+    const contacts = [...data.water_contacts].sort((a, b) => a.distance - b.distance).slice(0, 40)
+    for (const c of contacts) {
+      html += `<tr class="contact-row" data-chain="${escapeHtml(c.protein.chain)}" data-resi="${escapeHtml(String(c.protein.residue_id))}">
+        <td>${escapeHtml(c.water.chain)}:${escapeHtml(String(c.water.residue))}</td>
+        <td>${escapeHtml(c.protein.residue)}${escapeHtml(String(c.protein.residue_id))}/${escapeHtml(c.protein.atom)} (${escapeHtml(c.protein.chain)})</td>
+        <td>${Number(c.distance).toFixed(2)}</td>
+      </tr>`
+    }
+    html += '</tbody></table>'
+    pane.innerHTML = html
+    pane.querySelectorAll('.contact-row').forEach(row => {
+      row.addEventListener('click', () => {
+        if (!viewer) return
+        viewer.zoomTo({
+          chain: row.dataset.chain,
+          resi: parseInt(row.dataset.resi, 10),
+        })
+        viewer.render()
+      })
+    })
+  }
+
+  // ==================================================================
+  // V2: 2D ligand editor
+  // ==================================================================
+
+  const editorState = { atoms: [], bonds: [], selection: [], dirty: false }
+
+  async function editorLoad() {
+    if (!state.structure) {
+      showStatus('Open a structure and select a ligand first', true)
+      return
+    }
+    try {
+      const data = await sendCommand('get_ligand_2d', {})
+      editorState.atoms = data.atoms || []
+      editorState.bonds = data.bonds || []
+      editorState.selection = []
+      editorState.dirty = false
+      drawEditorCanvas()
+      el('editor-info').innerHTML =
+        `<div class="v2-summary">${escapeHtml(data.residue_name || '')}: ${editorState.atoms.length} atoms, ${editorState.bonds.length} bonds (CCD bond orders)</div>`
+      showStatus('Ligand loaded into 2D editor')
+    } catch (e) {
+      showStatus(`Editor load failed: ${e.message}`, true)
+    }
+  }
+
+  function drawEditorCanvas() {
+    const canvas = el('editor-canvas')
+    if (!canvas) return
+    const ctx = canvas.getContext('2d')
+    ctx.clearRect(0, 0, canvas.width, canvas.height)
+    const atoms = editorState.atoms
+    if (atoms.length === 0) return
+    // Real 2D coordinates from the editor state (x/y), auto-scaled to fit.
+    const xs = atoms.map(a => a.x), ys = atoms.map(a => a.y)
+    const minX = Math.min(...xs), maxX = Math.max(...xs)
+    const minY = Math.min(...ys), maxY = Math.max(...ys)
+    const pad = 28
+    const scale = Math.min(
+      (canvas.width - 2 * pad) / Math.max(maxX - minX, 0.001),
+      (canvas.height - 2 * pad) / Math.max(maxY - minY, 0.001))
+    const toPx = a => ({
+      px: pad + (a.x - minX) * scale + (canvas.width - 2 * pad - (maxX - minX) * scale) / 2,
+      py: canvas.height - (pad + (a.y - minY) * scale + (canvas.height - 2 * pad - (maxY - minY) * scale) / 2),
+    })
+    // Bonds (double/triple drawn as parallel lines)
+    for (const b of editorState.bonds) {
+      const a1 = atoms.find(a => a.id === b.from)
+      const a2 = atoms.find(a => a.id === b.to)
+      if (!a1 || !a2) continue
+      const p1 = toPx(a1), p2 = toPx(a2)
+      const order = b.order || 1
+      ctx.strokeStyle = '#8b949e'
+      for (let k = 0; k < order; k++) {
+        const off = (k - (order - 1) / 2) * 3.2
+        const dx = p2.px - p1.px, dy = p2.py - p1.py
+        const len = Math.hypot(dx, dy) || 1
+        ctx.beginPath()
+        ctx.moveTo(p1.px - dy / len * off, p1.py + dx / len * off)
+        ctx.lineTo(p2.px - dy / len * off, p2.py + dx / len * off)
+        ctx.stroke()
+      }
+    }
+    // Atoms
+    for (const a of atoms) {
+      const { px, py } = toPx(a)
+      const selected = editorState.selection.includes(a.id)
+      const color = ELEMENT_COLORS[(a.element || '').toUpperCase()] || '#c9d1d9'
+      ctx.beginPath()
+      ctx.arc(px, py, selected ? 8 : 6, 0, 2 * Math.PI)
+      ctx.fillStyle = selected ? '#58a6ff' : color
+      ctx.fill()
+      if (a.element && a.element !== 'C') {
+        ctx.fillStyle = '#0d1117'
+        ctx.font = 'bold 8px sans-serif'
+        ctx.textAlign = 'center'
+        ctx.textBaseline = 'middle'
+        ctx.fillText(a.element, px, py)
+      }
+    }
+  }
+
+  function editorPick(event) {
+    const canvas = el('editor-canvas')
+    if (!canvas || editorState.atoms.length === 0) return
+    const rect = canvas.getBoundingClientRect()
+    const mx = (event.clientX - rect.left) * (canvas.width / rect.width)
+    const my = (event.clientY - rect.top) * (canvas.height / rect.height)
+    // Find nearest atom in canvas space using the same transform as drawing.
+    const atoms = editorState.atoms
+    const xs = atoms.map(a => a.x), ys = atoms.map(a => a.y)
+    const minX = Math.min(...xs), maxX = Math.max(...xs)
+    const minY = Math.min(...ys), maxY = Math.max(...ys)
+    const pad = 28
+    const scale = Math.min(
+      (canvas.width - 2 * pad) / Math.max(maxX - minX, 0.001),
+      (canvas.height - 2 * pad) / Math.max(maxY - minY, 0.001))
+    let best = null, bestD = 14 * 14
+    for (const a of atoms) {
+      const px = pad + (a.x - minX) * scale + (canvas.width - 2 * pad - (maxX - minX) * scale) / 2
+      const py = canvas.height - (pad + (a.y - minY) * scale + (canvas.height - 2 * pad - (maxY - minY) * scale) / 2)
+      const d = (px - mx) ** 2 + (py - my) ** 2
+      if (d < bestD) { best = a; bestD = d }
+    }
+    if (!best) return
+    // Two-step selection: first pick selects, second pick applies the
+    // pending operation (bond/atom removal or bond creation).
+    if (editorState.pendingOp) {
+      const op = editorState.pendingOp
+      editorState.pendingOp = null
+      applyEditorOp(op, best.id)
+      return
+    }
+    editorState.selection = [best.id]
+    drawEditorCanvas()
+    el('editor-info').innerHTML =
+      `<div class="v2-summary">selected atom ${best.id} (${escapeHtml(best.element || '?')}) — pick an operation, then a second atom when prompted</div>`
+  }
+
+  async function applyEditorOp(op, secondAtomId) {
+    try {
+      let result
+      if (op.kind === 'add_bond') {
+        result = await sendCommand('editor_add_bond', {
+          from_atom: op.atomId, to_atom: secondAtomId,
+          order: op.order,
+        })
+      } else if (op.kind === 'remove_bond') {
+        result = await sendCommand('editor_remove_bond', {
+          from_atom: op.atomId, to_atom: secondAtomId,
+        })
+      }
+      if (result?.state) {
+        editorState.atoms = result.state.atoms
+        editorState.bonds = result.state.bonds
+        editorState.selection = []
+        editorState.dirty = true
+        drawEditorCanvas()
+      }
+    } catch (e) {
+      showStatus(`Edit failed: ${e.message}`, true)
+    }
+  }
+
+  async function editorAddAtom() {
+    const element = el('editor-element')?.value || 'C'
+    // Place the new atom at the centroid of the current layout (real 2D
+    // coordinates; the user drags positions via update_position later).
+    const atoms = editorState.atoms
+    if (!atoms.length) {
+      showStatus('Load a ligand first', true)
+      return
+    }
+    const cx = atoms.reduce((s, a) => s + a.x, 0) / atoms.length
+    const cy = atoms.reduce((s, a) => s + a.y, 0) / atoms.length
+    try {
+      const result = await sendCommand('editor_add_atom', {
+        element, x: cx + 1.5, y: cy + 1.5,
+      })
+      editorState.atoms = result.state.atoms
+      editorState.bonds = result.state.bonds
+      editorState.dirty = true
+      drawEditorCanvas()
+      el('editor-info').innerHTML =
+        `<div class="v2-summary">added ${escapeHtml(element)} atom ${result.atom_id}</div>`
+    } catch (e) {
+      showStatus(`Add atom failed: ${e.message}`, true)
+    }
+  }
+
+  function editorRemoveAtom() {
+    if (editorState.selection.length !== 1) {
+      showStatus('Select one atom first (click it on the canvas)', true)
+      return
+    }
+    sendCommand('editor_remove_atom', { atom_id: editorState.selection[0] })
+      .then(result => {
+        editorState.atoms = result.state.atoms
+        editorState.bonds = result.state.bonds
+        editorState.selection = []
+        editorState.dirty = true
+        drawEditorCanvas()
+      })
+      .catch(e => showStatus(`Remove atom failed: ${e.message}`, true))
+  }
+
+  function editorBeginOp(kind) {
+    if (editorState.selection.length !== 1) {
+      showStatus('Select one atom first (click it on the canvas)', true)
+      return
+    }
+    const order = kind === 'add_bond'
+      ? parseInt(el('editor-bond-order')?.value || '1', 10) : 1
+    editorState.pendingOp = { kind, atomId: editorState.selection[0], order }
+    showStatus('Now click the second atom')
+  }
+
+  async function editorExportSdf() {
+    try {
+      const result = await sendCommand('editor_export_sdf', {})
+      const dest = await save({
+        defaultPath: 'edited_ligand.sdf',
+        filters: [{ name: 'SDF', extensions: ['sdf'] }],
+      })
+      if (dest) {
+        await invoke('copy_file', { src: result.path, dest })
+        showStatus('Edited ligand SDF saved')
+      }
+    } catch (e) {
+      showStatus(`Editor export failed: ${e.message}`, true)
+    }
+  }
+
+  // ==================================================================
+  // V2: scripting console
+  // ==================================================================
+
+  async function runScript() {
+    const code = el('script-input')?.value || ''
+    if (!code.trim()) return
+    try {
+      const result = await sendCommand('run_script', { code })
+      const out = el('script-output')
+      if (out) {
+        const printed = result.output || ''
+        const vars = (result.variables || []).join(', ') || '(none)'
+        out.textContent = `${printed || '(no output)'}\n# variables now defined: ${vars}`
+      }
+      showStatus('Script executed')
+    } catch (e) {
+      const out = el('script-output')
+      if (out) out.textContent = `Error: ${e.message}`
+      showStatus(`Script failed: ${e.message}`, true)
+    }
+  }
+
+  // ==================================================================
+  // V2: pose comparison
+  // ==================================================================
+
+  async function refreshComparisonJobs() {
+    try {
+      const data = await sendCommand('list_jobs', {})
+      const completed = (data.jobs || []).filter(j => j.status === 'completed' && j.pose_count > 0)
+      for (const id of ['compare-job-a', 'compare-job-b']) {
+        const sel = el(id)
+        if (!sel) continue
+        const current = sel.value
+        sel.innerHTML = '<option value="">Job...</option>' +
+          completed.map(j =>
+            `<option value="${escapeHtml(j.job_id)}">${escapeHtml(j.job_id.slice(0, 8))} (${j.pose_count} poses${j.best_affinity != null ? `, ${Number(j.best_affinity).toFixed(1)} kcal/mol` : ''})</option>`
+          ).join('')
+        if (current) sel.value = current
+      }
+    } catch {
+      // No jobs yet - selection stays empty.
+    }
+  }
+
+  async function runComparison() {
+    const a = el('compare-job-a')?.value
+    const b = el('compare-job-b')?.value
+    if (!a || !b) {
+      showStatus('Select two completed docking jobs', true)
+      return
+    }
+    try {
+      const data = await sendCommand('compare_results', { job_id_a: a, job_id_b: b })
+      renderComparison(data)
+      showStatus(`Compared: avg RMSD ${data.avg_rmsd ?? '—'} Å`)
+    } catch (e) {
+      showStatus(`Comparison failed: ${e.message}`, true)
+    }
+  }
+
+  function renderComparison(data) {
+    const pane = el('compare-results')
+    if (!pane) return
+    const best = data.best_matches || []
+    if (best.length === 0) {
+      pane.innerHTML = '<div class="v2-placeholder">No comparable poses</div>'
+      return
+    }
+    let html = `<div class="v2-summary">average RMSD ${Number(data.avg_rmsd).toFixed(2)} Å (Kabsch-superposed, atom-name matched)</div>`
+    html += '<table><thead><tr><th>A pose</th><th>B pose</th><th>RMSD Å</th><th>A aff.</th><th>B aff.</th><th>Δ kcal/mol</th></tr></thead><tbody>'
+    for (const m of best) {
+      html += `<tr>
+        <td>${m.pose1}</td><td>${m.pose2}</td>
+        <td>${Number(m.rmsd).toFixed(2)}</td>
+        <td>${Number(m.pose1_affinity).toFixed(2)}</td>
+        <td>${Number(m.pose2_affinity).toFixed(2)}</td>
+        <td>${Number(m.energy_diff).toFixed(2)}</td>
+      </tr>`
+    }
+    html += '</tbody></table>'
+    pane.innerHTML = html
+  }
+
+  // ==================================================================
+  // V2: tab switching
+  // ==================================================================
+
+  function initV2Tabs() {
+    const dock = el('v2-dock')
+    if (!dock) return
+    dock.querySelectorAll('.v2-tab').forEach(tab => {
+      tab.addEventListener('click', () => {
+        dock.querySelectorAll('.v2-tab').forEach(t => t.classList.remove('active'))
+        dock.querySelectorAll('.v2-panel').forEach(p => p.classList.add('v2-hidden'))
+        tab.classList.add('active')
+        el(`v2-panel-${tab.dataset.tab}`)?.classList.remove('v2-hidden')
+        if (tab.dataset.tab === 'compare') refreshComparisonJobs()
+        if (tab.dataset.tab === 'editor') drawEditorCanvas()
+      })
+    })
+    dock.querySelector('.v2-tab')?.classList.add('active')
+    el('v2-panel-batch')?.classList.remove('v2-hidden')
+  }
+
+  // ------------------------------------------------------------------
+  // Wiring
+  // ------------------------------------------------------------------
+
+  function upgrade(container) {
+    // Inject the ligand selector above the ligand card.
+    const card = el('ligand-card')
+    if (card && !el('ligand-select')) {
+      const select = document.createElement('select')
+      select.id = 'ligand-select'
+      select.className = 'select'
+      card.parentElement.insertBefore(select, card)
+      select.addEventListener('change', (e) => selectLigand(e.target.value))
+    }
+    // Hidden until measure mode is on.
+    container.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && state.measureMode) toggleMeasure()
+    })
+    // 2D editor canvas: atom picking.
+    el('editor-canvas')?.addEventListener('click', editorPick)
+  }
+
+  async function start() {
+    initViewer()
+
+    el('btn-open-file')?.addEventListener('click', openLocalFile)
+    el('btn-open-pdb')?.addEventListener('click', openPdbId)
+    el('btn-run-analysis')?.addEventListener('click', runAnalysis)
+    el('btn-export')?.addEventListener('click', exportArtifacts)
+    el('btn-measure')?.addEventListener('click', toggleMeasure)
+    el('btn-get-status')?.addEventListener('click', refreshStatus)
+
+    el('select-representation')?.addEventListener('change', (e) => {
+      state.representation = e.target.value
+      applyView()
+    })
+    el('select-colorscheme')?.addEventListener('change', (e) => {
+      state.colorScheme = e.target.value
+      applyView()
+    })
+
+    let notesTimer = null
+    el('notes-area')?.addEventListener('input', (e) => {
+      clearTimeout(notesTimer)
+      notesTimer = setTimeout(() => {
+        sendCommand('set_notes', { notes: e.target.value })
+          .catch(err => showStatus(`Notes not saved: ${err.message}`, true))
+      }, 600)
+    })
+
+    // Job progress events from the backend (forwarded by the Rust bridge).
+    // Tauri-only API: browser (dev/automation) mode skips event listening.
+    const IN_TAURI = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
+    if (IN_TAURI) {
+      listen('backend-event', (event) => {
+        const payload = event.payload?.data || event.payload || {}
+        if (payload.job_id) {
+          sendCommand('get_job', { job_id: payload.job_id })
+            .then(showJobResult)
+            .catch(() => {})
+        }
+      })
+    }
+
+    // V2 surfaces.
+    initV2Tabs()
+    el('btn-batch-run')?.addEventListener('click', runBatch)
+    el('btn-batch-export')?.addEventListener('click', exportBatch)
+    el('btn-water-analyze')?.addEventListener('click', analyzeWaterNetwork)
+    el('btn-editor-load')?.addEventListener('click', editorLoad)
+    el('btn-editor-export')?.addEventListener('click', editorExportSdf)
+    el('btn-editor-add-atom')?.addEventListener('click', editorAddAtom)
+    el('btn-editor-del-atom')?.addEventListener('click', editorRemoveAtom)
+    el('btn-editor-add-bond')?.addEventListener('click', () => editorBeginOp('add_bond'))
+    el('btn-editor-del-bond')?.addEventListener('click', () => editorBeginOp('remove_bond'))
+    el('btn-script-run')?.addEventListener('click', runScript)
+    el('btn-compare-run')?.addEventListener('click', runComparison)
+
+    await refreshStatus()
+  }
+
+  return { upgrade, start }
 }

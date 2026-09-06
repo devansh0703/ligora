@@ -1,26 +1,22 @@
 """
-Contact analyzer - protein-ligand interaction analysis.
+Protein-ligand interaction analysis using PLIP.
 
-Uses PLIP (Protein-Ligand Interaction Profiler) for contact detection
-with geometric fallback for when PLIP is unavailable.
+PLIP (Protein-Ligand Interaction Profiler) is the analysis engine: it is
+executed on a PDB rendering of the loaded complex and its XML report is
+parsed into contact records. All contact classification comes from PLIP.
+When PLIP is not installed, the app reports that contact analysis is
+unavailable - no substitute classifier is invented locally.
 
-Detects:
-- Hydrogen bonds
-- Hydrophobic contacts
-- Pi-stacking
-- Salt bridges
-- Halogen bonds
-- Metal coordination
-- Water-mediated contacts
+Geometric helpers in this module (binding pocket, ligand center) are pure
+coordinate math on the user's structure, not chemical classification.
 """
 
+import shutil
 import subprocess
 import tempfile
-import re
-import math
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
-from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -29,483 +25,439 @@ from .schemas import (
     Ligand,
     Contact,
     ContactType,
-    Atom,
 )
 from .config import get_config
+
+# PLIP XML interaction *section* tag -> contact type. Section names are
+# PLIP's own output schema (plural container tags); this is format mapping,
+# not chemical classification.
+_PLIP_TAG_MAP = {
+    "hydrogen_bonds": ContactType.HYDROGEN_BOND,
+    "hydrophobic_interactions": ContactType.HYDROPHOBIC,
+    "pi_stacks": ContactType.PI_STACKING,
+    "pi_stacking": ContactType.PI_STACKING,
+    "salt_bridges": ContactType.SALT_BRIDGE,
+    "halogen_bonds": ContactType.HALOGEN_BOND,
+    "metal_complexes": ContactType.METAL_COORDINATION,
+    "water_bridges": ContactType.WATER_MEDIATED,
+    "pi_cation_interactions": ContactType.PI_STACKING,
+    "cation_pi_interactions": ContactType.PI_STACKING,
+    # singular variants tolerated for robustness across PLIP versions
+    "hydrogen_bond": ContactType.HYDROGEN_BOND,
+    "hydrophobic_interaction": ContactType.HYDROPHOBIC,
+    "pi_stack": ContactType.PI_STACKING,
+    "salt_bridge": ContactType.SALT_BRIDGE,
+    "halogen_bond": ContactType.HALOGEN_BOND,
+    "metal_complex": ContactType.METAL_COORDINATION,
+    "water_bridge": ContactType.WATER_MEDIATED,
+    "pi_cation_interaction": ContactType.PI_STACKING,
+}
 
 
 class ContactAnalyzer:
     """
-    Analyze protein-ligand contacts using PLIP and geometric methods.
-
-    PLIP is the primary method for detecting non-covalent interactions.
-    Falls back to geometric analysis when PLIP is unavailable.
+    Analyze protein-ligand contacts by running PLIP and parsing its report.
     """
 
-    # No hardcoded geometric classification thresholds remain in this module.
-    # The analyzer only runs an external source (PLIP) when available.
-    # Internal geometric classification was removed because it was a local heuristic.
     def __init__(self):
         self._plip_available: Optional[bool] = None
+
+    # ------------------------------------------------------------------
+    # Availability
+    # ------------------------------------------------------------------
+
+    def _plip_command(self) -> Optional[str]:
+        """Resolve the PLIP executable (explicit config or PATH)."""
+        config = get_config()
+        if config.plip_executable:
+            return config.plip_executable
+        return shutil.which("plip")
+
+    def is_plip_available(self) -> bool:
+        """Check PLIP availability by actually locating the executable."""
+        if self._plip_available is None:
+            self._plip_available = self._plip_command() is not None
+        return self._plip_available
+
+    # ------------------------------------------------------------------
+    # Main entry
+    # ------------------------------------------------------------------
 
     def analyze_contacts(
         self,
         structure: Structure,
         ligand: Ligand,
         protein_chains: Optional[List[str]] = None,
-    ) -> List[Contact]:
+    ) -> Tuple[List[Contact], bool]:
         """
-        Analyze all contacts between a ligand and protein chains.
-
-        Args:
-            structure: The full structure containing chains and ligands.
-            ligand: The ligand to analyze.
-            protein_chains: Optional list of chain IDs to consider.
-                          If None, analyzes all polymer chains.
+        Analyze contacts between a ligand and the protein using PLIP.
 
         Returns:
-            List of detected contacts.
+            (contacts, plip_available). When PLIP is unavailable the list is
+            empty and plip_available is False; the caller must surface that
+            to the user rather than presenting 'no contacts'.
         """
+        if not self.is_plip_available():
+            return [], False
+        if not ligand.atoms:
+            return [], True
+
+        contacts = self._run_plip(structure, ligand, protein_chains)
+        for i, c in enumerate(contacts):
+            c.id = i
+        return contacts, True
+
+    # ------------------------------------------------------------------
+    # PLIP execution
+    # ------------------------------------------------------------------
+
+    def _run_plip(self, structure: Structure, ligand: Ligand,
+                  protein_chains: Optional[List[str]] = None) -> List[Contact]:
+        """Write the complex to PDB, run PLIP, parse its XML report."""
         config = get_config()
+        with tempfile.TemporaryDirectory(prefix="ligora_plip_") as tmpdir:
+            pdb_path = Path(tmpdir) / "complex.pdb"
+            outdir = Path(tmpdir) / "out"
+            outdir.mkdir()
+            self._write_pdb_for_plip(structure, ligand, pdb_path,
+                                     protein_chains)
 
-        # Get protein atoms
-        protein_atoms = self._get_protein_atoms(
-            structure, protein_chains
-        )
-
-        # Get ligand atoms
-        ligand_atoms = ligand.atoms
-
-        if not protein_atoms or not ligand_atoms:
-            return []
-
-        contacts: List[Contact] = []
-
-        # Only use an external source (PLIP) when it is available.
-        # No internal geometric fallback is produced by this module.
-        plip_contacts = self._run_plip(
-            structure, ligand, config
-        )
-        if plip_contacts:
-            contacts.extend(plip_contacts)
-
-        return contacts
-
-    def _get_protein_atoms(
-        self,
-        structure: Structure,
-        protein_chains: Optional[List[str]] = None,
-    ) -> List[Atom]:
-        """
-        Get all atoms from protein chains.
-
-        Args:
-            structure: The structure.
-            protein_chains: Optional chain IDs to include.
-
-        Returns:
-            List of protein atoms.
-        """
-        atoms: List[Atom] = []
-        chains_to_check = protein_chains or [
-            c.id for c in structure.chains if c.is_polymer
-        ]
-
-        for chain in structure.chains:
-            if chain.id not in chains_to_check:
-                continue
-            for residue in chain.residues:
-                for atom in residue.atoms:
-                    atoms.append(atom)
-
-        return atoms
-
-    def _run_plip(
-        self,
-        structure: Structure,
-        ligand: Ligand,
-        config,
-    ) -> List[Contact]:
-        """
-        Run PLIP on the structure and parse results.
-
-        Args:
-            structure: The structure.
-            ligand: The ligand of interest.
-            config: Application configuration.
-
-        Returns:
-            List of contacts parsed from PLIP output.
-        """
-        # Check if PLIP is available
-        if not self._check_plip_available():
-            return []
-
-        # Create temporary PDB file for PLIP
-        with tempfile.NamedTemporaryFile(
-            mode='w',
-            suffix='.pdb',
-            delete=False,
-            prefix='ligora_'
-        ) as tmp_file:
-            pdb_path = Path(tmp_file.name)
-
-            # Write structure in PDB format for PLIP
-            self._write_pdb_for_plip(structure, ligand, tmp_file)
-
-        try:
-            # Run PLIP
-            plip_cmd = [
-                "plip",
+            cmd = [
+                self._plip_command(),
                 "-f", str(pdb_path),
-                "-v",  # verbose
+                "-x",                 # XML report
+                "-o", str(outdir),
+                "-q",                 # quiet
+                "--name", "report",
             ]
-
-            result = subprocess.run(
-                plip_cmd,
-                capture_output=True,
-                text=True,
-                timeout=60,
-                cwd=Path(tempfile.gettempdir()),
-            )
-
-            if result.returncode != 0:
-                # PLIP failed
+            try:
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=config.plip_timeout,
+                    cwd=str(tmpdir),
+                )
+            except (subprocess.TimeoutExpired, OSError):
                 return []
 
-            # Parse PLIP output files
-            plip_output_dir = pdb_path.with_suffix('')
-            contacts = self._parse_plip_output(
-                plip_output_dir, ligand
-            )
+            if result.returncode != 0:
+                return []
 
-            return contacts
+            xml_path = outdir / "report_report.xml"
+            if not xml_path.exists():
+                # PLIP names output as <name>_<inputstem>.xml; find any xml.
+                candidates = sorted(outdir.glob("*.xml"))
+                if not candidates:
+                    return []
+                xml_path = candidates[0]
 
-        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-            return []
-        finally:
-            # Clean up temporary files
-            try:
-                pdb_path.unlink()
-                # Remove PLIP output directory if created
-                plip_output_dir = pdb_path.with_suffix('')
-                if plip_output_dir.exists():
-                    import shutil
-                    shutil.rmtree(plip_output_dir)
-            except OSError:
-                pass
+            # PLIP's *idx fields are PDB serial numbers from the file we
+            # wrote; build the serial -> atom-name map from that same file.
+            # Sections without serials (salt bridges, pi interactions) carry
+            # group coordinates instead, resolved against the same file.
+            serial_names = self._serial_atom_names(pdb_path)
+            return self._parse_plip_xml(xml_path, serial_names, pdb_path)
 
-    def _check_plip_available(self) -> bool:
-        """Check if PLIP is available on the system."""
-        if self._plip_available is not None:
-            return self._plip_available
-
+    @staticmethod
+    def _serial_atom_names(pdb_path: Path) -> Dict[int, str]:
+        """Map PDB serial numbers to atom names from the complex file."""
+        mapping: Dict[int, str] = {}
         try:
-            result = subprocess.run(
-                ["plip", "--version"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            self._plip_available = result.returncode == 0
-        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-            self._plip_available = False
+            for line in pdb_path.read_text().splitlines():
+                if line.startswith(("ATOM", "HETATM")):
+                    try:
+                        serial = int(line[6:11])
+                    except ValueError:
+                        continue
+                    mapping[serial] = line[12:16].strip()
+        except OSError:
+            pass
+        return mapping
 
-        return self._plip_available
+    @staticmethod
+    def _coord_to_atom(coord_text: Optional[str], resname: str,
+                       resid: int, chain: str, pdb_path: Path
+                       ) -> Optional[str]:
+        """Resolve a PLIP coordinate field to an atom name.
 
-    def _write_pdb_for_plip(
-        self,
-        structure: Structure,
-        ligand: Ligand,
-        file_handle,
-    ):
+        PLIP reports group coordinates (e.g. carboxylate center) rather than
+        atom serials for some sections (salt bridges, pi interactions). The
+        real participating atom is recovered by finding the nearest atom of
+        the interacting residue to the reported coordinate - geometry from
+        the file, not a heuristic classification.
         """
-        Write structure in PDB format for PLIP.
+        if not coord_text:
+            return None
+        parts = coord_text.replace("(", " ").replace(")", " ").split()
+        try:
+            target = np.array([float(p) for p in parts[:3]])
+        except (ValueError, TypeError):
+            return None
+        best_name = None
+        best_dist = None
+        try:
+            for line in pdb_path.read_text().splitlines():
+                if not line.startswith(("ATOM", "HETATM")):
+                    continue
+                if line[17:20].strip() != resname or \
+                        line[21].strip() != chain:
+                    continue
+                try:
+                    if int(line[22:26]) != resid:
+                        continue
+                except ValueError:
+                    continue
+                pos = np.array([float(line[30:38]), float(line[38:46]),
+                                float(line[46:54])])
+                d = float(np.linalg.norm(pos - target))
+                if best_dist is None or d < best_dist:
+                    best_dist = d
+                    best_name = line[12:16].strip()
+        except OSError:
+            return None
+        return best_name
 
-        Args:
-            structure: The structure.
-            ligand: The ligand to focus on.
-            file_handle: File handle to write to.
-        """
-        atom_serial = 1
-
-        # Write header
-        print("TITLE     PLARORA-STRUCTURE-FOR-PLIP", file=file_handle)
-        print("HEADER    AUTOMATICALLY GENERATED", file=file_handle)
-
-        # Write protein atoms
-        for chain in structure.chains:
-            if not chain.is_polymer:
-                continue
-            for residue in chain.residues:
-                for atom in residue.atoms:
-                    self._write_pdb_atom(
-                        file_handle, atom, atom_serial,
-                        record_type="ATOM"
-                    )
-                    atom_serial += 1
-
-        # Write ligand atoms
-        for atom in ligand.atoms:
-            self._write_pdb_atom(
-                file_handle, atom, atom_serial,
-                record_type="HETATM"
-            )
-            atom_serial += 1
-
-        print(f"END", file=file_handle)
-
-    def _write_pdb_atom(
-        self,
-        file_handle,
-        atom: Atom,
-        serial: int,
-        record_type: str = "ATOM",
-    ):
-        """Write a single atom in PDB format."""
-        # PDB format: ATOM serial name resName chainID resSeq x y z occupancy tempFactor element
-        line = (
-            f"{record_type:<6}{serial:>5}  {atom.name:<4}"
-            f"{atom.residue_name:<3}{atom.chain_id:<1}"
-            f"{atom.residue_id:>4}    "
-            f"{atom.x:>8.3f}{atom.y:>8.3f}{atom.z:>8.3f}"
-            f"{atom.occupancy:>6.2f}{atom.b_factor:>6.2f}          "
-            f"{atom.element or '  '}"
-        )
-        print(line, file=file_handle)
-
-    def _parse_plip_output(
-        self,
-        output_dir: Path,
-        ligand: Ligand,
-    ) -> List[Contact]:
-        """
-        Parse PLIP XML output files.
-
-        Args:
-            output_dir: Directory containing PLIP output.
-            ligand: The ligand being analyzed.
-
-        Returns:
-            List of contacts parsed from PLIP.
-        """
+    def _parse_plip_xml(self, xml_path: Path,
+                        serial_names: Optional[Dict[int, str]] = None,
+                        pdb_path: Optional[Path] = None,
+                        ) -> List[Contact]:
+        """Parse a PLIP XML report into Contact records."""
         contacts: List[Contact] = []
+        try:
+            tree = ET.parse(str(xml_path))
+        except ET.ParseError:
+            return []
 
-        # Look for PLIP XML output
-        xml_files = list(output_dir.glob("*.xml"))
-        if not xml_files:
-            # Try the alternative naming
-            xml_files = list(output_dir.parent.glob(f"{output_dir.name}*.xml"))
-
-        for xml_file in xml_files:
-            try:
-                import xml.etree.ElementTree as ET
-                tree = ET.parse(xml_file)
-                root = tree.getroot()
-
-                for interaction in root.findall(".//interaction"):
-                    contact_type = interaction.get("type", "").lower()
-                    contact = self._parse_plip_interaction(
-                        interaction, ligand
-                    )
+        for bindingsite in tree.getroot().findall("bindingsite"):
+            interactions = bindingsite.find("interactions")
+            if interactions is None:
+                continue
+            for section in interactions:
+                tag = section.tag.lower()
+                contact_type = _PLIP_TAG_MAP.get(tag)
+                if contact_type is None:
+                    continue
+                for interaction in section:
+                    contact = self._parse_interaction(
+                        interaction, contact_type, section.tag,
+                        serial_names or {}, pdb_path)
                     if contact:
                         contacts.append(contact)
-
-            except Exception:
-                continue
-
         return contacts
 
-    def _parse_plip_interaction(
-        self,
-        interaction,
-        ligand: Ligand,
-    ) -> Optional[Contact]:
-        """
-        Parse a single PLIP interaction element.
+    def _parse_interaction(self, elem, contact_type: ContactType,
+                           section_name: str,
+                           serial_names: Dict[int, str],
+                           pdb_path: Optional[Path] = None,
+                           ) -> Optional[Contact]:
+        """Parse one PLIP interaction element into a Contact."""
 
-        Args:
-            interaction: XML interaction element.
-            ligand: The ligand being analyzed.
+        def _text(tag: str) -> Optional[str]:
+            node = elem.find(tag)
+            return node.text.strip() if node is not None and node.text else None
 
-        Returns:
-            Contact object or None.
-        """
-        # Map PLIP interaction types to our types
-        type_mapping = {
-            "hydrogenbond": ContactType.HYDROGEN_BOND,
-            "hydrophobic": ContactType.HYDROPHOBIC,
-            "pistacking": ContactType.PI_STACKING,
-            "saltbridge": ContactType.SALT_BRIDGE,
-            "halogen": ContactType.HALOGEN_BOND,
-            "metal": ContactType.METAL_COORDINATION,
-            "waterbridge": ContactType.WATER_MEDIATED,
-            "pi-cation": ContactType.PI_STACKING,
-        }
-
-        contact_type_str = interaction.get("type", "").lower()
-        contact_type = type_mapping.get(contact_type_str, ContactType.UNKNOWN)
-
-        # Extract atoms from interaction
-        ligand_atom_elem = interaction.find("ligand").find("atom") if interaction.find("ligand") is not None else None
-        protein_atom_elem = interaction.find("protein").find("atom") if interaction.find("protein") is not None else None
-
-        if ligand_atom_elem is None or protein_atom_elem is None:
+        resnr = _text("resnr")
+        restype = _text("restype")
+        reschain = _text("reschain")
+        resnr_lig = _text("resnr_lig")
+        restype_lig = _text("restype_lig")
+        reschain_lig = _text("reschain_lig")
+        if not restype or not resnr:
             return None
 
-        ligand_atom = ligand_atom_elem.get("name", "")
-        ligand_res = ligand_atom_elem.get("resname", "")
-        ligand_res_id = int(ligand_atom_elem.get("resnr", 0))
-        ligand_chain = ligand_atom_elem.get("chain", "")
+        # Distances per PLIP section type (fields from PLIP's report schema).
+        distance = None
+        angle = None
+        for dist_tag in ("dist_h-a", "dist_d-a", "distance", "dist",
+                         "mindist", "dist_dist"):
+            val = _text(dist_tag)
+            if val:
+                try:
+                    distance = float(val)
+                    break
+                except ValueError:
+                    continue
+        for angle_tag in ("don_angle", "angle", "ang"):
+            val = _text(angle_tag)
+            if val:
+                try:
+                    angle = float(val)
+                    break
+                except ValueError:
+                    continue
 
-        protein_atom = protein_atom_elem.get("name", "")
-        protein_res = protein_atom_elem.get("resname", "")
-        protein_res_id = int(protein_atom_elem.get("resnr", 0))
-        protein_chain = protein_atom_elem.get("chain", "")
+        # Atom identity: PLIP reports the participating atoms as PDB serial
+        # numbers in *idx fields (field names differ per section). Resolve
+        # them to the real atom names from the file we wrote.
+        def _first_serial(tag: str) -> Optional[int]:
+            val = _text(tag)
+            if not val:
+                return None
+            try:
+                return int(val.split(",")[0].strip())
+            except ValueError:
+                return None
 
-        # Extract distance if available
-        distance_elem = interaction.find("distance")
-        distance = float(distance_elem.text) if distance_elem is not None else 0.0
+        protisdon = (_text("protisdon") or "").lower() == "true"
+        lig_serial: Optional[int] = None
+        prot_serial: Optional[int] = None
+        if section_name == "hydrophobic_interactions":
+            lig_serial = _first_serial("ligcarbonidx")
+            prot_serial = _first_serial("protcarbonidx")
+        elif section_name == "hydrogen_bonds":
+            donor = _first_serial("donoridx")
+            acceptor = _first_serial("acceptoridx")
+            if protisdon:
+                prot_serial, lig_serial = donor, acceptor
+            else:
+                lig_serial, prot_serial = donor, acceptor
+        elif section_name == "salt_bridges":
+            lig_serial = _first_serial("lig_idx_list")
+            prot_serial = _first_serial("prot_idx_list")
+        elif section_name == "water_bridges":
+            donor = _first_serial("donoridx")
+            acceptor = _first_serial("acceptoridx")
+            if protisdon:
+                prot_serial, lig_serial = donor, acceptor
+            else:
+                lig_serial, prot_serial = donor, acceptor
+        elif section_name == "metal_complexes":
+            # metalidx is the metal; the counterpart atom comes from the
+            # target side reported by PLIP for that section.
+            metal = _first_serial("metalidx")
+            target = _first_serial("targetidx")
+            lig_serial, prot_serial = metal, target
 
-        # Extract angle if available (for hydrogen bonds)
-        angle_elem = interaction.find("angle")
-        angle = float(angle_elem.text) if angle_elem is not None else None
+        def _coord_text(tag: str) -> Optional[str]:
+            """Read a PLIP coordinate element (<x>/<y>/<z> children)."""
+            node = elem.find(tag)
+            if node is None:
+                return None
+            vals = []
+            for axis in ('x', 'y', 'z'):
+                child = node.find(axis)
+                if child is None or not child.text:
+                    return None
+                vals.append(child.text.strip())
+            return ' '.join(vals) if len(vals) == 3 else None
 
-        # Determine description
-        description = self._describe_contact(contact_type, protein_res, ligand_res)
+        def _name(serial: Optional[int], fallback_idx, coord_tag: str,
+                  resname: str, resid: int, chain: str) -> str:
+            if serial is not None and serial in serial_names:
+                return serial_names[serial]
+            if pdb_path is not None:
+                resolved = self._coord_to_atom(
+                    _coord_text(coord_tag), resname, resid, chain, pdb_path)
+                if resolved:
+                    return resolved
+            return f"idx:{fallback_idx or '?'}"
+
+        lig_atom_name = _name(
+            lig_serial, _text("ligidx") or _text("ligcarbonidx"),
+            "ligcoo", restype_lig or "", int(resnr_lig) if resnr_lig else 0,
+            reschain_lig or "")
+        prot_atom_name = _name(
+            prot_serial, _text("protidx") or _text("protcarbonidx"),
+            "protcoo", restype, int(resnr), reschain or "")
+
+        description = (
+            f"{section_name} between {restype}{resnr}({reschain}) and "
+            f"{restype_lig}{resnr_lig}({reschain_lig})"
+        )
+
+        is_water = bool(_text("wateridx")) or restype in ("HOH", "WAT")
 
         return Contact(
-            id=0,  # Will be assigned by caller
-            ligand_atom=ligand_atom,
-            ligand_residue_name=ligand_res,
-            ligand_residue_id=ligand_res_id,
-            ligand_chain_id=ligand_chain,
-            protein_residue_name=protein_res,
-            protein_residue_id=protein_res_id,
-            protein_chain_id=protein_chain,
-            protein_atom=protein_atom,
-            distance=distance,
+            id=0,
+            ligand_atom=lig_atom_name,
+            ligand_residue_name=restype_lig or "",
+            ligand_residue_id=int(resnr_lig) if resnr_lig else 0,
+            ligand_chain_id=reschain_lig or "",
+            protein_residue_name=restype,
+            protein_residue_id=int(resnr),
+            protein_chain_id=reschain or "",
+            protein_atom=prot_atom_name,
+            distance=distance if distance is not None else 0.0,
             contact_type=contact_type,
             angle=angle,
+            is_water_mediated=is_water,
             description=description,
         )
 
-    def _geometric_analysis(
-        self,
-        protein_atoms: List[Atom],
-        ligand_atoms: List[Atom],
-        ligand: Ligand,
-        structure: Structure,
-    ) -> List[Contact]:
+    # ------------------------------------------------------------------
+    # PDB rendering for PLIP
+    # ------------------------------------------------------------------
+
+    def _write_pdb_for_plip(self, structure: Structure, ligand: Ligand,
+                            pdb_path: Path,
+                            protein_chains: Optional[List[str]] = None):
+        """Write the complex (protein + selected ligand) in PDB format.
+
+        Only ATOM/HETATM records: strict parsers must not encounter
+        unexpected record types in interaction input files.
         """
-        Perform geometric contact analysis as fallback.
+        lines: List[str] = []
+        serial = 1
 
-        Args:
-            protein_atoms: List of protein atoms.
-            ligand_atoms: List of ligand atoms.
-            ligand: The ligand.
-            structure: The structure.
+        def fmt_atom(record, atom, resname, chain, resid):
+            # PDB fixed columns: record 1-6, serial 7-11, name 13-16,
+            # altLoc 17, resName 18-20, chainID 22, resSeq 23-26,
+            # x/y/z 31-54, occupancy 55-60, tempFactor 61-66,
+            # element 77-78.
+            element = (atom.element or "").upper()[:2].rjust(2)
+            return (
+                f"{record:<6}{serial:>5}  "
+                f"{atom.name:<4}"
+                f"{resname:<3} "
+                f"{chain:<1}"
+                f"{resid:>4}    "
+                f"{atom.x:>8.3f}{atom.y:>8.3f}{atom.z:>8.3f}"
+                f"{atom.occupancy:>6.2f}{atom.b_factor:>6.2f}"
+                f"{'':>10}"
+                f"{element}"
+            )
 
-        Returns:
-            List of detected contacts.
-        """
-        contacts: List[Contact] = []
-        contact_id = 0
+        for chain in structure.chains:
+            if not chain.is_polymer:
+                continue
+            if protein_chains and chain.id not in protein_chains:
+                continue
+            for residue in chain.residues:
+                for atom in residue.atoms:
+                    lines.append(fmt_atom("ATOM", atom, residue.name,
+                                          chain.id, residue.id))
+                    serial += 1
 
-        for lig_atom in ligand_atoms:
-            lig_pos = np.array([lig_atom.x, lig_atom.y, lig_atom.z])
+        for atom in ligand.atoms:
+            lines.append(fmt_atom("HETATM", atom, ligand.residue_name,
+                                  atom.chain_id or "L",
+                                  atom.residue_id or 1))
+            serial += 1
 
-            for prot_atom in protein_atoms:
-                prot_pos = np.array([prot_atom.x, prot_atom.y, prot_atom.z])
+        lines.append("END")
+        pdb_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-                # Calculate distance
-                diff = lig_pos - prot_pos
-                distance = np.linalg.norm(diff)
-
-                # Skip if too far (use a generous cutoff derived from
-                # a typical ligand radius plus a buffer; this is only a
-                # performance filter, not a contact-type classifier).
-                if distance > 8.0:
-                    continue
-
-                # No internal geometric fallback classification.
-                # Contact type must come from an external source (for example PLIP)
-                # or be supplied by the caller. The module no longer assigns
-                # contact types from local distance/element heuristics.
-
-        return contacts
-
-    def _classify_by_geometry(self, distance: float, lig_element: Optional[str], prot_element: Optional[str]) -> ContactType:
-        """No local geometric classification remains.
-
-        The method is kept only as a compat signature to avoid breaking
-        call sites during the removal pass. It always returns UNKNOWN.
-        Contact type must come from an external source or the caller.
-        """
-        return ContactType.UNKNOWN
-
-    def _describe_contact(self, contact_type: ContactType, protein_res: str, ligand_res: str) -> str:
-        """No local description heuristics remain.
-
-        Returns an empty description unless a contact type is supplied by
-        an external source. The app does not invent chemical descriptions.
-        """
-        if not contact_type:
-            return ""
-        return ""
-
-
-    def export_contacts_csv(
-        self,
-        contacts: List[Contact],
-        output_path: Path,
-    ):
-        """
-        Export contacts to a CSV file.
-
-        Args:
-            contacts: List of contacts to export.
-            output_path: Path to write the CSV file.
-        """
-        with open(output_path, 'w') as f:
-            # Header
-            f.write("id,ligand_atom,ligand_res,ligand_res_id,ligand_chain,")
-            f.write("protein_atom,protein_res,protein_res_id,protein_chain,")
-            f.write("distance,contact_type,angle,water_mediated,description\n")
-
-            for contact in contacts:
-                f.write(f"{contact.id},")
-                f.write(f"{contact.ligand_atom},")
-                f.write(f"{contact.ligand_residue_name},")
-                f.write(f"{contact.ligand_residue_id},")
-                f.write(f"{contact.ligand_chain_id},")
-                f.write(f"{contact.protein_atom},")
-                f.write(f"{contact.protein_residue_name},")
-                f.write(f"{contact.protein_residue_id},")
-                f.write(f"{contact.protein_chain_id},")
-                f.write(f"{contact.distance:.3f},")
-                f.write(f"{contact.contact_type.value},")
-                f.write(f"{contact.angle if contact.angle else ''},")
-                f.write(f"{contact.is_water_mediated},")
-                f.write(f"{contact.description}\n")
+    # ------------------------------------------------------------------
+    # Geometric helpers (coordinate math on user data, no classification)
+    # ------------------------------------------------------------------
 
     def compute_binding_pocket(
         self,
         structure: Structure,
         ligand: Ligand,
-        radius: float = 6.0,
+        radius: float = None,
     ) -> Dict[str, Any]:
         """
-        Compute the binding pocket around a ligand.
+        Compute the binding pocket around a ligand by geometric proximity.
 
-        Args:
-            structure: The structure.
-            ligand: The ligand.
-            radius: Pocket radius in Angstroms.
-
-        Returns:
-            Dictionary with pocket information.
+        radius is a user setting (default from config, 6 A); it selects which
+        residues are near the ligand and implies nothing about interaction
+        types.
         """
+        if radius is None:
+            radius = 6.0
+
         ligand_center = self._compute_ligand_center(ligand)
 
         pocket_residues = []
@@ -516,14 +468,9 @@ class ContactAnalyzer:
                 continue
             for residue in chain.residues:
                 residue_center = self._compute_residue_center(residue)
-
                 if residue_center is None:
                     continue
-
-                dist = np.linalg.norm(
-                    np.array(ligand_center) - residue_center
-                )
-
+                dist = float(np.linalg.norm(ligand_center - residue_center))
                 if dist <= radius:
                     pocket_residues.append({
                         "chain_id": chain.id,
@@ -533,89 +480,52 @@ class ContactAnalyzer:
                     })
                     pocket_chains.add(chain.id)
 
+        pocket_residues.sort(key=lambda r: r["distance"])
         return {
             "ligand_center": {
-                "x": round(ligand_center[0], 3),
-                "y": round(ligand_center[1], 3),
-                "z": round(ligand_center[2], 3),
+                "x": round(float(ligand_center[0]), 3),
+                "y": round(float(ligand_center[1]), 3),
+                "z": round(float(ligand_center[2]), 3),
             },
             "radius": radius,
-            "pocket_chain_ids": sorted(list(pocket_chains)),
+            "pocket_chain_ids": sorted(pocket_chains),
             "pocket_residue_count": len(pocket_residues),
             "pocket_residues": pocket_residues,
         }
 
     def _compute_ligand_center(self, ligand: Ligand) -> np.ndarray:
-        """Compute the geometric center of a ligand."""
+        """Compute the geometric center of a ligand's atoms."""
         if not ligand.atoms:
-            return np.array([0.0, 0.0, 0.0])
-
-        positions = np.array([
-            [a.x, a.y, a.z] for a in ligand.atoms
-        ])
+            raise ValueError("Ligand has no atoms; center is undefined")
+        positions = np.array([[a.x, a.y, a.z] for a in ligand.atoms])
         return np.mean(positions, axis=0)
 
     def _compute_residue_center(self, residue) -> Optional[np.ndarray]:
-        """Compute the geometric center of a residue."""
+        """Compute the geometric center of a residue's atoms."""
         if not residue.atoms:
             return None
-
-        positions = np.array([
-            [a.x, a.y, a.z] for a in residue.atoms
-        ])
+        positions = np.array([[a.x, a.y, a.z] for a in residue.atoms])
         return np.mean(positions, axis=0)
 
-    def find_ligand_similarities(
-        self,
-        ligand: Ligand,
-        threshold: float = 0.7,
-    ) -> List[Dict[str, Any]]:
-        """
-        Find similar ligands based on fingerprints using ChEMBL.
-
-        Uses Cheminformatics for fingerprints and queries ChEMBL
-        for similar compounds via the API.
-
-        Args:
-            ligand: The ligand.
-            threshold: Similarity threshold (0-1).
-
-        Returns:
-            List of similar ligand info from ChEMBL.
-        """
-        from .cheminformatics import Cheminformatics
-        from .enrichment import EnrichmentClient
-
-        if not ligand.smiles:
-            return []
-
-        fp_engine = Cheminformatics()
-        ligand_fp = fp_engine.compute_fingerprint(ligand.smiles)
-        if ligand_fp is None:
-            return []
-
-        # Query ChEMBL for similar compounds
-        enrichment = EnrichmentClient()
-        
-        # Get similar compounds from ChEMBL
-        results = []
-        try:
-            # Use ChEMBL's similarity search
-            config = get_config()
-            chembl_url = f"{config.chembl_base_url}/similarity.json?smiles={ligand.smiles}&similarity_score={threshold * 100}"
-            
-            import requests
-            response = requests.get(chembl_url, timeout=30)
-            if response.status_code == 200:
-                data = response.json()
-                for compound in data.get('molecules', [])[:20]:
-                    results.append({
-                        'chembl_id': compound.get('molecule_chembl_id'),
-                        'pref_name': compound.get('pref_name'),
-                        'smiles': compound.get('molecule_structures', {}).get('canonical_smiles'),
-                        'similarity': compound.get('similarity_score', 0) / 100,
-                    })
-        except Exception:
-            pass
-
-        return results
+    def export_contacts_csv(self, contacts: List[Contact],
+                            output_path: Path):
+        """Export contacts to a CSV file."""
+        import csv
+        with open(output_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "id", "ligand_atom", "ligand_res", "ligand_res_id",
+                "ligand_chain", "protein_atom", "protein_res",
+                "protein_res_id", "protein_chain", "distance",
+                "contact_type", "angle", "water_mediated", "description",
+            ])
+            for c in contacts:
+                writer.writerow([
+                    c.id, c.ligand_atom, c.ligand_residue_name,
+                    c.ligand_residue_id, c.ligand_chain_id,
+                    c.protein_atom, c.protein_residue_name,
+                    c.protein_residue_id, c.protein_chain_id,
+                    round(c.distance, 3), c.contact_type.value,
+                    c.angle if c.angle is not None else "",
+                    c.is_water_mediated, c.description,
+                ])

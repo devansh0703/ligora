@@ -30,7 +30,7 @@ print(json.dumps({
         "id": open_result["structure"]["id"],
         "title": open_result["structure"]["title"],
         "chains": [c["id"] for c in open_result["structure"]["chains"]],
-        "ligands": [l["residue_name"] for l in open_result["structure"]["ligands"]],
+        "ligands": [lig["residue_name"] for lig in open_result["structure"]["ligands"]],
     },
     "select": {
         "ligand_name": select_result["ligand"]["name"],

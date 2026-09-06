@@ -1,995 +1,425 @@
 """
-Enrichment client for live data lookup from external sources.
+Enrichment client for live data lookup from external open sources.
 
-Integrates with:
-- RCSB PDB (structure metadata, annotations, related structures)
-- PubChem (compound identity, properties, bioactivity)
-- ChEMBL (bioactivity data, targets, binding data)
-- PDBBind (binding affinity data)
+Integrates:
+- RCSB Data API (structure metadata, CCD chemical components)
+- PubChem PUG-REST (compound identity, properties, bioactivity)
+- ChEMBL REST (compound context, bioactivity)
+- UniChem (identifier cross-mapping by InChIKey)
+
+Every value comes from a live source response; nothing is synthesized
+locally. Failures return None / empty and the UI reports the gap.
 """
 
-import json
 import hashlib
 import time
-from pathlib import Path
-from typing import Optional, List, Dict, Any, Tuple
-from dataclasses import dataclass, field
+from typing import Optional, List, Dict, Any
+from urllib.parse import quote
 
 import requests
 
-from .schemas import EvidenceItem, LigandResolutionStatus
+from .schemas import EvidenceItem
 from .config import get_config
-
-Config = get_config
 
 
 class EnrichmentClient:
-    """
-    Client for fetching enrichment data from external APIs.
-
-    Provides:
-    - RCSB CCD lookup for chemical component identity and classification
-    - RCSB structure annotations
-    - PubChem compound lookup
-    - ChEMBL bioactivity data
-    - PDBBind affinity lookup
-
-    All chemical values come from those sources. No chemical data is
-    hardcoded or synthesized locally.
-    """
+    """Client for fetching enrichment data from external APIs."""
 
     def __init__(self):
-        """Initialize the enrichment client."""
-        self._cache: Dict[str, Dict[str, Any]] = {}
+        self._cache: Dict[str, Any] = {}
         self._cache_expiry: Dict[str, float] = {}
         self._session = requests.Session()
         self._session.headers.update({
-            'User-Agent': 'Ligora/0.1.0 (https://github.com/ligora)',
+            'User-Agent': 'Ligora/0.1.0 (open-source molecular workstation)',
         })
 
-    def get_compound_from_ccd(self, residue_name: str) -> Optional[Dict[str, Any]]:
-        """
-        Retrieve chemical component data from the RCSB CCD.
+    # ------------------------------------------------------------------
+    # Cache helpers
+    # ------------------------------------------------------------------
 
-        Tries the compound endpoint first, then the ligand endpoint.
-        """
-        compound = self.get_compound_from_ccd_v1_compound(residue_name)
-        if compound is None:
-            compound = self.get_compound_from_ccd_v1_ligand(residue_name)
-        return compound
+    def _is_cache_valid(self, key: str) -> bool:
+        if key not in self._cache_expiry:
+            return False
+        return time.time() < self._cache_expiry[key]
 
-    def get_compound_from_ccd_v1_compound(self, residue_name: str) -> Optional[Dict[str, Any]]:
-        """
-        Retrieve chemical component data from the RCSB /v1/compound/{id} endpoint.
-        """
-        cache_key = f"ccd:compound:{residue_name}"
-        if self._is_cache_valid(cache_key):
-            return self._cache.get(cache_key)
-
+    def _cached(self, key: str, fetch):
+        if self._is_cache_valid(key):
+            return self._cache.get(key)
+        value = fetch()
         config = get_config()
-        url = f"{config.rcsb_base_url}/v1/compound/{residue_name}"
+        self._cache[key] = value
+        self._cache_expiry[key] = time.time() + config.cache_ttl_seconds
+        return value
 
-        try:
-            response = self._session.get(url, timeout=config.request_timeout)
-            if response.status_code != 200:
-                return None
-            data = response.json()
-            return self._parse_ccd_compound_v1_compound(data)
-        except requests.RequestException:
-            return None
+    def clear_cache(self):
+        self._cache.clear()
+        self._cache_expiry.clear()
 
-    def get_compound_from_ccd_v1_ligand(self, residue_name: str) -> Optional[Dict[str, Any]]:
-        """
-        Retrieve chemical component data from the RCSB /v1/ligand/{id} endpoint.
-        """
-        cache_key = f"ccd:ligand:{residue_name}"
-        if self._is_cache_valid(cache_key):
-            return self._cache.get(cache_key)
-
-        config = get_config()
-        url = f"{config.rcsb_base_url}/v1/ligand/{residue_name}"
-
-        try:
-            response = self._session.get(url, timeout=config.request_timeout)
-            if response.status_code != 200:
-                return None
-            data = response.json()
-            return self._parse_ccd_compound_v1_ligand(data)
-        except requests.RequestException:
-            return None
-
-    def _parse_ccd_compound_v1_compound(self, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """
-        Retrieve chemical component data from the RCSB CCD.
-
-        Args:
-            residue_name: The 3-letter CCD identifier (for example HEM, ATP, HOH).
-
-        Returns:
-            CCD data useful for ligand identity and classification, or None.
-        """
-        cache_key = f"ccd:{residue_name}"
-        if self._is_cache_valid(cache_key):
-            return self._cache.get(cache_key)
-
-        config = get_config()
-        url = f"{config.rcsb_base_url}/v1/compound/{residue_name}"
-
-        try:
-            response = self._session.get(url, timeout=config.request_timeout)
-            if response.status_code != 200:
-                return None
-            data = response.json()
-            return self._parse_ccd_compound(data)
-        except requests.RequestException:
-            return None
-
-    def get_compound_from_ccd_v1_compound(self, residue_name: str) -> Optional[Dict[str, Any]]:
-        """
-        Retrieve chemical component data from the RCSB /v1/compound/{id} endpoint.
-
-        Args:
-            residue_name: The 3-letter CCD identifier (for example HEM, ATP, HOH).
-
-        Returns:
-            CCD data useful for ligand identity and classification, or None.
-        """
-        cache_key = f"ccd:compound:{residue_name}"
-        if self._is_cache_valid(cache_key):
-            return self._cache.get(cache_key)
-
-        config = get_config()
-        url = f"{config.rcsb_base_url}/v1/compound/{residue_name}"
-
-        try:
-            response = self._session.get(url, timeout=config.request_timeout)
-            if response.status_code != 200:
-                return None
-            data = response.json()
-            return self._parse_ccd_compound_v1_compound(data)
-        except requests.RequestException:
-            return None
-
-    def _parse_ccd_compound_v1_compound(self, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Extract authoritative CCD fields from the /v1/compound response shape."""
-        compound = data.get('compound') or data
-        if not isinstance(compound, dict):
-            compound = data
-
-        name = compound.get('name') or ''
-        formula = compound.get('formula') or compound.get('chemical_formula') or compound.get('formula_string') or ''
-        inchi_key = compound.get('inchi_key') or ''
-        pdbx_type = compound.get('pdbx_type') or compound.get('type') or compound.get('chemical_type') or ''
-        iupac_name = compound.get('iupac_name') or ''
-        molecular_weight = compound.get('molecular_weight')
-        smiles = compound.get('smiles') or ''
-
-        if not smiles:
-            rep = compound.get('representative') or {}
-            if not smiles:
-                smiles = rep.get('smiles') or ''
-            if not inchi_key:
-                inchi_key = rep.get('inchi_key') or ''
-
-        result = {
-            'name': name,
-            'formula': formula,
-            'inchi_key': inchi_key,
-            'pdbx_type': pdbx_type,
-            'iupac_name': iupac_name,
-            'molecular_weight': molecular_weight,
-            'smiles': smiles,
-        }
-        if not name and not formula and not pdbx_type:
-            return None
-        return result
-
-    def _parse_ccd_compound_v1_ligand(self, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Extract authoritative CCD fields from the /v1/ligand response shape."""
-        lig = data.get('ligand') or data
-        if not isinstance(lig, dict):
-            lig = data
-
-        name = lig.get('name') or ''
-        formula = lig.get('formula') or ''
-        inchi_key = lig.get('inchi_key') or ''
-        pdbx_type = lig.get('pdbx_type') or ''
-        iupac_name = lig.get('iupac_name') or ''
-        molecular_weight = lig.get('molecular_weight')
-        smiles = lig.get('smiles') or ''
-
-        if not smiles:
-            rep = lig.get('representative') or {}
-            if not smiles:
-                smiles = rep.get('smiles') or ''
-            if not inchi_key:
-                inchi_key = rep.get('inchi_key') or ''
-
-        result = {
-            'name': name,
-            'formula': formula,
-            'inchi_key': inchi_key,
-            'pdbx_type': pdbx_type,
-            'iupac_name': iupac_name,
-            'molecular_weight': molecular_weight,
-            'smiles': smiles,
-        }
-        if not name and not formula and not pdbx_type:
-            return None
-        return result
-
-    def _parse_ccd_compound_v1_ligand(self, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Extract authoritative CCD fields from the /v1/ligand response shape."""
-        lig = data.get('ligand') or data
-        if not isinstance(lig, dict):
-            lig = data
-
-        name = lig.get('name') or ''
-        formula = lig.get('formula') or ''
-        inchi_key = lig.get('inchi_key') or ''
-        pdbx_type = lig.get('pdbx_type') or ''
-        iupac_name = lig.get('iupac_name') or ''
-        molecular_weight = lig.get('molecular_weight')
-        smiles = lig.get('smiles') or ''
-
-        if not smiles:
-            rep = lig.get('representative') or {}
-            if not smiles:
-                smiles = rep.get('smiles') or ''
-            if not inchi_key:
-                inchi_key = rep.get('inchi_key') or ''
-
-        result = {
-            'name': name,
-            'formula': formula,
-            'inchi_key': inchi_key,
-            'pdbx_type': pdbx_type,
-            'iupac_name': iupac_name,
-            'molecular_weight': molecular_weight,
-            'smiles': smiles,
-        }
-        if not name and not formula and not pdbx_type:
-            return None
-        return result
-
-    def _parse_ccd_compound(self, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Extract authoritative CCD fields from a RCSB compound response.
-
-        CCD is the source of record for chemical component identity in the PDB.
-        This parser tolerates several response shapes returned by the live API
-        and only keeps fields that come directly from that source.
-        """
-        compound = data.get('compound') or data
-        if not isinstance(compound, dict):
-            compound = data
-
-        name = compound.get('name') or ''
-        formula = compound.get('formula') or ''
-        inchi_key = compound.get('inchi_key') or ''
-        pdbx_type = compound.get('pdbx_type') or ''
-        iupac_name = compound.get('iupac_name') or ''
-        molecular_weight = compound.get('molecular_weight')
-        smiles = compound.get('smiles') or ''
-
-        # CCD compound responses sometimes embed the representation block
-        # under different keys; try a couple of common shapes.
-        if not smiles:
-            rep = compound.get('representative') or {}
-            if not smiles:
-                smiles = rep.get('smiles') or ''
-            if not inchi_key:
-                inchi_key = rep.get('inchi_key') or ''
-
-        # Alternate shapes observed in live responses
-        if not formula:
-            formula = compound.get('chemical_formula') or compound.get('formula_string') or ''
-        if not pdbx_type:
-            pdbx_type = compound.get('type') or compound.get('chemical_type') or ''
-
-        result = {
-            'name': name,
-            'formula': formula,
-            'inchi_key': inchi_key,
-            'pdbx_type': pdbx_type,
-            'iupac_name': iupac_name,
-            'molecular_weight': molecular_weight,
-            'smiles': smiles,
-        }
-        if not name and not formula and not pdbx_type:
-            return None
-        return result
+    # ------------------------------------------------------------------
+    # RCSB structure metadata
+    # ------------------------------------------------------------------
 
     def get_structure_metadata(self, pdb_id: str) -> Optional[Dict[str, Any]]:
-        """
-        Fetch metadata for a PDB structure from RCSB.
-
-        Args:
-            pdb_id: PDB ID (e.g., "1ABC").
-
-        Returns:
-            Structure metadata or None if unavailable.
-        """
+        """Entry metadata from the RCSB Data API."""
+        pdb_id = pdb_id.strip().upper()
         cache_key = f"metadata:{pdb_id}"
-        if self._is_cache_valid(cache_key):
-            return self._cache.get(cache_key)
 
-        config = get_config()
-        url = f"{config.rcsb_base_url}/v1/core/entry/{pdb_id}"
-
-        try:
-            response = self._session.get(
-                url,
-                timeout=config.request_timeout,
-            )
-            if response.status_code == 200:
+        def fetch():
+            config = get_config()
+            url = f"{config.rcsb_data_url}/core/entry/{pdb_id}"
+            try:
+                response = self._session.get(
+                    url, timeout=config.request_timeout)
+                if response.status_code != 200:
+                    return None
                 data = response.json()
+
+                rcsb_info = data.get('rcsb_entry_info', {})
+                exptl = data.get('exptl', [{}])
+                refine = data.get('refine', [{}])
+
                 result = {
                     'pdb_id': pdb_id,
-                    'title': data.get('title', ''),
-                    'resolution': data.get('structure_determination_method',
-                                          {}).get('resolution'),
-                    'experiment_type': data.get('structure_determination_method',
-                                                {}).get('method'),
-                    'deposition_date': data.get('deposited'),
-                    'release_date': data.get('released'),
-                    ' macromolecule_type': data.get('macromolecule_type'),
-                    'processing': data.get('assembly', {}).get('name'),
-                    'organism': data.get('source_organism', {}).get('scientific_name'),
-                    'mutations': data.get('macromolecule_details', {}).get('mutation'),
+                    'title': (data.get('struct', {}) or {}).get('title'),
+                    'experiment_type': (exptl[0] if exptl else {}).get(
+                        'method'),
+                    'deposition_date': (data.get('rcsb_accession_info', {})
+                                        or {}).get('deposit_date'),
+                    'release_date': (data.get('rcsb_accession_info', {})
+                                     or {}).get('initial_release_date'),
+                    'resolution': rcsb_info.get('resolution_combined'),
+                    'experimental_method': rcsb_info.get(
+                        'experimental_method'),
+                    'entry_info': rcsb_info,
                 }
-                self._set_cache(cache_key, result)
+                if not result['resolution'] and refine:
+                    result['resolution'] = (refine[0] or {}).get(
+                        'ls_d_res_high')
                 return result
-        except requests.RequestException:
-            pass
+            except (requests.RequestException, ValueError):
+                return None
 
-        return None
+        return self._cached(cache_key, fetch)
 
-    def get_related_structures(
-        self,
-        pdb_id: str,
-        by_ligand: bool = True,
-        by_sequence: bool = False,
-        by_3d: bool = False,
-    ) -> List[Dict[str, Any]]:
-        """
-        Find related structures in the PDB.
+    # ------------------------------------------------------------------
+    # CCD chemical component (classification: pdbx_type)
+    # ------------------------------------------------------------------
 
-        Args:
-            pdb_id: PDB ID to find relatives for.
-            by_ligand: Find structures with same ligand.
-            by_sequence: Find structures with similar sequence.
-            by_3d: Find structures with similar 3D structure.
+    def get_compound_from_ccd(self, residue_name: str
+                              ) -> Optional[Dict[str, Any]]:
+        """Chemical component data from the RCSB CCD."""
+        if not residue_name:
+            return None
+        residue_name = residue_name.upper()
+        cache_key = f"ccd:{residue_name}"
 
-        Returns:
-            List of related structure info.
-        """
-        # Use RCSB Search API for related structures
-        config = get_config()
-        results = []
-
-        if by_ligand:
-            # Find structures with same ligands
-            url = f"{config.rcsb_search_url}/search/v2/query"
-
-            query = {
-                "query": {
-                    "type": "terminal",
-                    "service": "full_text",
-                    "parameters": {
-                        "value": pdb_id,
-                    }
-                },
-                "request": {
-                    "return_type": "entry",
-                    "request_mode": "interleaved",
-                    "pagination": {"start": 0, "rows": 20},
-                }
-            }
-
+        def fetch():
+            config = get_config()
+            url = (f"{config.rcsb_data_url}/core/chemcomp/"
+                   f"{quote(residue_name)}")
             try:
-                response = self._session.post(
-                    url,
-                    json=query,
-                    timeout=config.request_timeout,
-                )
-                if response.status_code == 200:
-                    data = response.json()
-                    result_set = data.get('result_set', [])
-                    for entry in result_set:
-                        pdb_id_entry = entry.get('identifier')
-                        if pdb_id_entry != pdb_id:
-                            results.append({
-                                'pdb_id': pdb_id_entry,
-                                'similarity': entry.get('score', 0),
-                                'type': 'same_ligand',
-                            })
-            except requests.RequestException:
-                pass
+                response = self._session.get(
+                    url, timeout=config.request_timeout)
+                if response.status_code != 200:
+                    return None
+                cc = (response.json().get('chem_comp') or {})
+                if not cc:
+                    return None
+                return {
+                    'id': cc.get('id'),
+                    'name': cc.get('name'),
+                    'formula': cc.get('formula'),
+                    'formula_weight': cc.get('formula_weight'),
+                    'type': cc.get('type'),
+                    'pdbx_type': cc.get('pdbx_type'),
+                }
+            except (requests.RequestException, ValueError):
+                return None
 
-        # For sequence/3D similarity, would use different query types
-        # This is a simplified implementation
+        return self._cached(cache_key, fetch)
 
-        return results[:20]
+    # ------------------------------------------------------------------
+    # PubChem
+    # ------------------------------------------------------------------
 
-    def get_ligand_3d_info(self, ligand: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """
-        Get 3D structure information for a ligand.
+    PUBCHEM_PROPERTY_FIELDS = [
+        'MolecularWeight', 'ConnectivitySMILES', 'IsomericSMILES',
+        'IUPACName', 'InChIKey', 'XLogP', 'TPSA', 'HBondAcceptorCount',
+        'HBondDonorCount', 'RotatableBondCount', 'ExactMass', 'Complexity',
+    ]
 
-        Args:
-            ligand: Ligand data with CCD ID.
-
-        Returns:
-            3D structure info or None.
-        """
-        ccd_id = ligand.get('ccd_id') or ligand.get('residue_name')
-        if not ccd_id:
+    def _fetch_pubchem_properties(self, cid: int) -> Optional[Dict[str, Any]]:
+        """Fetch PubChem properties in one PUG-REST call."""
+        config = get_config()
+        fields = ','.join(self.PUBCHEM_PROPERTY_FIELDS)
+        url = (f"{config.pubchem_base_url}/compound/cid/{cid}/"
+               f"property/{fields}/JSON")
+        try:
+            response = self._session.get(url, timeout=config.request_timeout)
+            if response.status_code != 200:
+                return None
+            props = response.json().get('PropertyTable', {}).get(
+                'Properties', [])
+            return props[0] if props else None
+        except (requests.RequestException, ValueError):
             return None
 
-        config = get_config()
-        url = f"{config.rcsb_base_url}/v1/ligand/{ccd_id}/structure"
+    def get_pubchem_info(self, compound_name: Optional[str] = None,
+                         smiles: Optional[str] = None,
+                         pubchem_cid: Optional[int] = None,
+                         ) -> Optional[Dict[str, Any]]:
+        """Compound info from PubChem by CID, name, or SMILES."""
+        cache_key = "pubchem:" + hashlib.md5(
+            f"{pubchem_cid}:{compound_name}:{smiles}".encode()
+        ).hexdigest()[:16]
 
-        try:
-            response = self._session.get(
-                url,
-                timeout=config.request_timeout,
-            )
-            if response.status_code == 200:
-                data = response.json()
-                return {
-                    'ccd_id': ccd_id,
-                    'has_3d': data.get('has_3d_structure', False),
-                    '3d_source': data.get('3d_source'),
-                    '3d_url': data.get('3d_url'),
-                }
-        except requests.RequestException:
-            pass
+        def fetch():
+            config = get_config()
+            cid = pubchem_cid
 
-        return None
+            if cid is None and compound_name:
+                url = (f"{config.pubchem_base_url}/compound/name/"
+                       f"{quote(compound_name)}/cids/JSON")
+                try:
+                    resp = self._session.get(
+                        url, timeout=config.request_timeout)
+                    if resp.status_code == 200:
+                        cids = resp.json().get('IdentifierList', {}).get(
+                            'CID', [])
+                        cid = cids[0] if cids else None
+                except (requests.RequestException, ValueError):
+                    return None
 
-    def get_pubchem_info(
-        self,
-        compound_name: Optional[str] = None,
-        smiles: Optional[str] = None,
-        formula: Optional[str] = None,
-        pubchem_cid: Optional[int] = None,
-    ) -> Optional[Dict[str, Any]]:
-        """
-        Get compound information from PubChem.
+            # SMILES search via PubChem's fast identity endpoint
+            if cid is None and smiles:
+                url = (f"{config.pubchem_base_url}/compound/smiles/"
+                       f"{quote(smiles)}/cids/JSON")
+                try:
+                    resp = self._session.get(
+                        url, timeout=config.request_timeout)
+                    if resp.status_code == 200:
+                        cids = resp.json().get('IdentifierList', {}).get(
+                            'CID', [])
+                        cid = cids[0] if cids else None
+                except (requests.RequestException, ValueError):
+                    return None
 
-        Args:
-            compound_name: Compound name.
-            smiles: SMILES string.
-            formula: Chemical formula.
-            pubchem_cid: PubChem CID (if known).
+            if cid is None:
+                return None
 
-        Returns:
-            PubChem compound info or None.
-        """
-        cache_key_parts = [
-            str(pubchem_cid) if pubchem_cid else '',
-            str(compound_name) if compound_name else '',
-            str(smiles) if smiles else '',
-            str(formula) if formula else '',
-        ]
-        cache_key = f"pubchem:{hashlib.md5(
-            ':'.join(cache_key_parts).encode()
-        ).hexdigest()[:16]}"
-        if self._is_cache_valid(cache_key):
-            return self._cache.get(cache_key)
+            props = self._fetch_pubchem_properties(cid)
+            if not props:
+                return None
+            props['cid'] = cid
+            props['title'] = props.get('Title')
+            props['smiles'] = (props.get('IsomericSMILES') or
+                               props.get('ConnectivitySMILES'))
+            return props
 
-        config = get_config()
-        base_url = f"{config.pubchem_base_url}/rest"
+        return self._cached(cache_key, fetch)
 
-        try:
-            # If we have CID, fetch directly
-            if pubchem_cid:
-                url = f"{base_url}/compound/cid/{pubchem_cid}/property/" \
-                      "IUPACName,MolecularWeight,CanonicalSMILES," \
-                      "IsomericSMILES,InChIKey,Formula,XLogP,TSPA"
-                response = self._session.get(url, timeout=config.request_timeout)
-                if response.status_code == 200:
-                    props = response.json().get('PropertyTable', {}).get('Properties', [])
-                    if props:
-                        result = {
-                            'cid': pubchem_cid,
-                            'iupac_name': props[0].get('IUPACName'),
-                            'title': props[0].get('Title'),
-                            'smiles': props[0].get('CanonicalSMILES'),
-                            'isomeric_smiles': props[0].get('IsomericSMILES'),
-                            'inchi_key': props[0].get('InChIKey'),
-                            'formula': props[0].get('Formula'),
-                            'molecular_weight': props[0].get('MolecularWeight'),
-                            'xlogp': props[0].get('XLogP'),
-                            'tpsa': props[0].get('TSPA'),
-                            'source': 'pubchem',
-                        }
-                        self._set_cache(cache_key, result)
-                        return result
+    # ------------------------------------------------------------------
+    # ChEMBL
+    # ------------------------------------------------------------------
 
-            # Otherwise search by name
-            if compound_name:
-                search_url = f"{base_url}/compound/name/{compound_name.replace(' ', '%20')}"
-                response = self._session.get(search_url, timeout=config.request_timeout)
-                if response.status_code == 200:
-                    cids = response.json().get('IdentifierList', {}).get('CID', [])
-                    if cids:
-                        return self.get_pubchem_info(pubchem_cid=cids[0])
-
-            # Search by SMILES
-            if smiles:
-                # Use SMILES search in PubChem
-                search_url = f"{base_url}/compound/smiles/{smiles.replace(' ', '%20')}"
-                response = self._session.get(search_url, timeout=config.request_timeout)
-                if response.status_code == 200:
-                    cids = response.json().get('IdentifierList', {}).get('CID', [])
-                    if cids:
-                        return self.get_pubchem_info(pubchem_cid=cids[0])
-
-        except requests.RequestException:
-            pass
-
-        return None
-
-    def get_chembl_info(
-        self,
-        smiles: Optional[str] = None,
-        pubchem_cid: Optional[int] = None,
-        chembl_id: Optional[str] = None,
-    ) -> Optional[Dict[str, Any]]:
-        """
-        Get compound information from ChEMBL.
-
-        Args:
-            smiles: SMILES string.
-            pubchem_cid: PubChem CID for cross-reference.
-            chembl_id: ChEMBL compound ID.
-
-        Returns:
-            ChEMBL compound info or None.
-        """
+    def get_chembl_info(self, chembl_id: Optional[str] = None,
+                        smiles: Optional[str] = None,
+                        inchi_key: Optional[str] = None,
+                        ) -> Optional[Dict[str, Any]]:
+        """Compound info from ChEMBL by ID, or via UniChem InChIKey map."""
         if chembl_id:
             return self._get_chembl_by_id(chembl_id)
 
+        if inchi_key:
+            mapped = self._get_chembl_id_from_unichem(inchi_key)
+            if mapped:
+                return self._get_chembl_by_id(mapped)
+
         if smiles:
             return self._get_chembl_by_smiles(smiles)
+        return None
 
-        if pubchem_cid:
-            return self._get_chembl_by_pubchem(pubchem_cid)
-
+    def _get_chembl_id_from_unichem(self, inchi_key: str) -> Optional[str]:
+        """Map an InChIKey to a ChEMBL ID via the UniChem service."""
+        config = get_config()
+        url = f"{config.unichem_base_url}/inchikey/{inchi_key}"
+        try:
+            resp = self._session.get(url, timeout=config.request_timeout)
+            if resp.status_code != 200:
+                return None
+            mappings = resp.json()
+            if isinstance(mappings, list):
+                for m in mappings:
+                    if str(m.get('src_id')) == '1':  # 1 = ChEMBL
+                        return m.get('src_compound_id')
+        except (requests.RequestException, ValueError):
+            pass
         return None
 
     def _get_chembl_by_id(self, chembl_id: str) -> Optional[Dict[str, Any]]:
-        """Fetch ChEMBL compound by ID."""
         config = get_config()
         url = f"{config.chembl_base_url}/molecule/{chembl_id}.json"
-
         try:
             response = self._session.get(url, timeout=config.request_timeout)
-            if response.status_code == 200:
-                data = response.json()
-                molecule = data.get('molecule', {})
-                return {
-                    'chembl_id': chembl_id,
-                    'pref_name': molecule.get('pref_name'),
-                    'smiles': molecule.get('molecule_properties', {}).get('canonical_smiles'),
-                    'molecular_weight': molecule.get('molecule_properties', {}).get('full_mwt'),
-                    'alogp': molecule.get('molecule_properties', {}).get('alogp'),
-                    'hba': molecule.get('molecule_properties', {}).get('hba'),
-                    'hbd': molecule.get('molecule_properties', {}).get('hbd'),
-                    'source': 'chembl',
-                }
-        except requests.RequestException:
-            pass
-
-        return None
+            if response.status_code != 200:
+                return None
+            molecule = (response.json().get('molecule') or {})
+            props = (molecule.get('molecule_properties') or {})
+            structs = (molecule.get('molecule_structures') or {})
+            return {
+                'chembl_id': chembl_id,
+                'pref_name': molecule.get('pref_name'),
+                'smiles': props.get('canonical_smiles') or structs.get(
+                    'canonical_smiles'),
+                'molecular_weight': props.get('full_mwt'),
+                'formula': props.get('full_molformula'),
+                'alogp': props.get('alogp'),
+                'hba': props.get('hba'),
+                'hbd': props.get('hbd'),
+                'source': 'chembl',
+            }
+        except (requests.RequestException, ValueError):
+            return None
 
     def _get_chembl_by_smiles(self, smiles: str) -> Optional[Dict[str, Any]]:
-        """Search ChEMBL by SMILES using similarity search."""
+        """ChEMBL similarity search by SMILES."""
         config = get_config()
-        url = f"{config.chembl_base_url}/similarity.json?smiles={smiles}&similarity_score=70"
-        
+        url = (f"{config.chembl_base_url}/similarity/"
+               f"{quote(smiles)}/70.json?limit=1")
         try:
             response = self._session.get(url, timeout=config.request_timeout)
-            if response.status_code == 200:
-                data = response.json()
-                molecules = data.get('molecules', [])
-                if molecules:
-                    mol = molecules[0]
-                    mol_props = mol.get('molecule_properties', {})
-                    return {
-                        'chembl_id': mol.get('molecule_chembl_id'),
-                        'pref_name': mol.get('pref_name'),
-                        'smiles': mol_props.get('canonical_smiles'),
-                        'molecular_weight': mol_props.get('full_mwt'),
-                        'alogp': mol_props.get('alogp'),
-                        'hba': mol_props.get('hba'),
-                        'hbd': mol_props.get('hbd'),
-                        'source': 'chembl',
-                    }
-        except requests.RequestException:
-            pass
+            if response.status_code != 200:
+                return None
+            molecules = response.json().get('molecules', [])
+            if not molecules:
+                return None
+            mol = molecules[0]
+            props = (mol.get('molecule_properties') or {})
+            return {
+                'chembl_id': mol.get('molecule_chembl_id'),
+                'pref_name': mol.get('pref_name'),
+                'smiles': props.get('canonical_smiles'),
+                'molecular_weight': props.get('full_mwt'),
+                'source': 'chembl_similarity',
+            }
+        except (requests.RequestException, ValueError):
+            return None
 
-        return None
-
-    def _get_chembl_by_pubchem(self, pubchem_cid: int) -> Optional[Dict[str, Any]]:
-        """Get ChEMBL ID from PubChem CID cross-reference."""
+    def get_chembl_activity(self, chembl_id: str,
+                            limit: int = 50) -> List[Dict[str, Any]]:
+        """Bioactivity records for a ChEMBL compound."""
         config = get_config()
-        url = f"{config.pubchem_base_url}/rest/compound/cid/{pubchem_cid}/xrefs"
-
+        url = (f"{config.chembl_base_url}/activity.json?"
+               f"molecule_chembl_id={chembl_id}&limit={limit}")
+        activities: List[Dict[str, Any]] = []
         try:
             response = self._session.get(url, timeout=config.request_timeout)
-            if response.status_code == 200:
-                data = response.json()
-                # Look for ChEMBL cross-references
-                for xref_list in data.get('InformationList', {}).get('Information', [{}])[0].get('XrefList', []):
-                    if xref_list.get('Name') == 'ChEMBL':
-                        chembl_id = xref_list.get('Qualifier') or xref_list.get('ID')
-                        if chembl_id:
-                            return self._get_chembl_by_id(chembl_id)
-        except requests.RequestException:
-            pass
-
-        return None
-
-    def get_chembl_activity(
-        self,
-        chembl_id: str,
-        target_type: Optional[str] = None,
-    ) -> List[Dict[str, Any]]:
-        """
-        Get bioactivity data for a ChEMBL compound.
-
-        Args:
-            chembl_id: ChEMBL compound ID.
-            target_type: Optional target type filter.
-
-        Returns:
-            List of activity records.
-        """
-        config = get_config()
-        activities = []
-
-        # Get activities for this molecule
-        url = f"{config.chembl_base_url}/activity.json?molecule_chembl_id={chembl_id}&limit=100"
-
-        try:
-            response = self._session.get(url, timeout=config.request_timeout)
-            if response.status_code == 200:
-                data = response.json()
-                activities_list = data.get('activities', [])
-                for activity in activities_list[:50]:  # Limit to first 50
-                    if target_type and target_type not in str(activity):
-                        continue
-                    activities.append({
-                        'chembl_id': chembl_id,
-                        'activity_id': activity.get('activity_id'),
-                        'target_chembl_id': activity.get('target_chembl_id'),
-                        'target_type': activity.get('target_type'),
-                        'standard_type': activity.get('standard_type'),
-                        'standard_value': activity.get('standard_value'),
-                        'standard_units': activity.get('standard_units'),
-                        'relation': activity.get('relation'),
-                        'document_id': activity.get('document_id'),
-                        'source': 'chembl',
-                    })
-        except requests.RequestException:
-            pass
-
-        return activities
-
-    def get_pdbbind_info(
-        self,
-        pdb_id: str,
-        ligand_residue_name: str,
-    ) -> Optional[Dict[str, Any]]:
-        """
-        Get binding affinity information from PDBBind.
-
-        Args:
-            pdb_id: PDB ID.
-            ligand_residue_name: Ligand residue name.
-
-        Returns:
-            PDBBind entry info or None.
-        """
-        config = get_config()
-        url = f"{config.pdbbind_url}/api/v2/compounds/{pdb_id}"
-
-        try:
-            response = self._session.get(url, timeout=config.request_timeout)
-            if response.status_code == 200:
-                data = response.json()
-                # Extract affinity
-                affinity = data.get('affinity_value') or data.get('Kd') or data.get('Ki')
-                if affinity:
-                    return {
-                        'pdb_id': pdb_id,
-                        'ligand': ligand_residue_name,
-                        'affinity': float(affinity),
-                        'affinity_type': data.get('affinity_type'),
-                        'source': 'pdbbind',
-                    }
-        except requests.RequestException:
-            pass
-
-        return None
-
-    def get_pubchem_bioactivity(
-        self,
-        pubchem_cid: int,
-    ) -> List[Dict[str, Any]]:
-        """
-        Get bioactivity data from PubChem for a compound.
-
-        Args:
-            pubchem_cid: PubChem CID.
-
-        Returns:
-            List of bioactivity records.
-        """
-        config = get_config()
-        activities = []
-
-        url = f"{config.pubchem_base_url}/rest/pcassay/aid/{pubchem_cid}/cids/{pubchem_cid}/bioactivity"
-
-        try:
-            response = self._session.get(url, timeout=config.request_timeout)
-            if response.status_code == 200:
-                data = response.json()
-                # Process bioactivity data
-                pass  # Simplified
-        except requests.RequestException:
-            pass
-
-        return activities
-
-    def enrich_ligand(
-        self,
-        ligand: Dict[str, Any],
-        pdb_id: Optional[str] = None,
-        ccd_data: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        """
-        Enrich a ligand with data from multiple sources.
-
-        Chemical identity, formula, molecular weight, SMILES, and
-        classification must come from live data sources (CCD, PubChem,
-        ChEMBL, PDBBind), not from local heuristics.
-
-        Args:
-            ligand: Ligand data.
-            pdb_id: Optional PDB ID.
-            ccd_data: Optional RCSB CCD data for the ligand residue name.
-
-        Returns:
-            Enriched ligand data with evidence chain.
-        """
-        enriched = ligand.copy()
-        evidence: List[Dict[str, Any]] = []
-
-        # Attach authoritative CCD data first, because it is the source
-        # of record for chemical component identity in the PDB.
-        if ccd_data:
-            ccd_fields = []
-            if ccd_data.get('formula'):
-                enriched['formula'] = ccd_data.get('formula')
-                ccd_fields.append('formula')
-            if ccd_data.get('molecular_weight') is not None:
-                try:
-                    enriched['molecular_weight'] = float(ccd_data.get('molecular_weight'))
-                except (TypeError, ValueError):
-                    pass
-                ccd_fields.append('molecular_weight')
-            if ccd_data.get('smiles'):
-                enriched['smiles'] = ccd_data.get('smiles')
-                ccd_fields.append('smiles')
-            if ccd_data.get('inchi_key'):
-                enriched['inchi_key'] = ccd_data.get('inchi_key')
-                ccd_fields.append('inchi_key')
-            if ccd_data.get('name'):
-                enriched['name'] = ccd_data.get('name')
-                ccd_fields.append('name')
-            if ccd_data.get('pdbx_type'):
-                enriched['classification_hint'] = ccd_data.get('pdbx_type')
-                ccd_fields.append('pdbx_type')
-            if ccd_data.get('iupac_name'):
-                enriched['iupac_name'] = ccd_data.get('iupac_name')
-                ccd_fields.append('iupac_name')
-            if ccd_fields:
-                evidence.append({
-                    'source': 'rcsb_ccd',
-                    'fields': ccd_fields,
-                    'url': f"{config.rcsb_base_url}/v1/compound/{ligand.get('residue_name')}",
-                })
-
-        # Try PubChem by name/formula when no authoritative SMILES is available.
-        if not enriched.get('smiles') and (
-            ligand.get('name') or ligand.get('residue_name')
-        ):
-            pubchem_info = self.get_pubchem_info(
-                compound_name=ligand.get('name') or ligand.get('residue_name'),
-                formula=ligand.get('formula'),
-            )
-            if pubchem_info:
-                enriched['pubchem_cid'] = pubchem_info.get('cid')
-                enriched['pubchem_name'] = pubchem_info.get('title')
-                if not enriched.get('smiles'):
-                    enriched['smiles'] = pubchem_info.get('smiles')
-                if not enriched.get('inchi_key'):
-                    enriched['inchi_key'] = pubchem_info.get('inchi_key')
-                if pubchem_info.get('molecular_weight') is not None and not enriched.get('molecular_weight'):
-                    enriched['molecular_weight'] = pubchem_info.get('molecular_weight')
-                if pubchem_info.get('xlogp') is not None:
-                    enriched['xlogp'] = pubchem_info.get('xlogp')
-                if pubchem_info.get('tpsa') is not None:
-                    enriched['tpsa'] = pubchem_info.get('tpsa')
-                if pubchem_info.get('iupac_name'):
-                    enriched['iupac_name'] = pubchem_info.get('iupac_name')
-                evidence.append({
-                    'source': 'pubchem',
-                    'fields': ['cid', 'title', 'smiles', 'inchi_key', 'molecular_weight'],
-                    'url': f"https://pubchem.ncbi.nlm.nih.gov/compound/{pubchem_info.get('cid')}",
-                })
-
-        # Try ChEMBL for bioactivity context when a SMILES is available.
-        if enriched.get('smiles'):
-            chembl_info = self.get_chembl_info(smiles=enriched['smiles'])
-            if chembl_info:
-                enriched['chembl_id'] = chembl_info.get('chembl_id')
-                if not enriched.get('iupac_name'):
-                    enriched['iupac_name'] = chembl_info.get('pref_name')
-                evidence.append({
+            if response.status_code != 200:
+                return activities
+            for activity in response.json().get('activities', []):
+                activities.append({
+                    'activity_id': activity.get('activity_id'),
+                    'target_chembl_id': activity.get('target_chembl_id'),
+                    'target_type': activity.get('target_type'),
+                    'standard_type': activity.get('standard_type'),
+                    'standard_value': activity.get('standard_value'),
+                    'standard_units': activity.get('standard_units'),
+                    'relation': activity.get('relation'),
                     'source': 'chembl',
-                    'fields': ['chembl_id', 'pref_name', 'smiles'],
-                    'url': f"https://www.ebi.ac.uk/chembl/compound_report_card/{chembl_info.get('chembl_id')}",
                 })
+        except requests.RequestException:
+            pass
+        return activities
 
-        # Try PDBBind for affinity context when a PDB ID is available.
-        if pdb_id:
-            pdbbind_info = self.get_pdbbind_info(
-                pdb_id,
-                ligand.get('residue_name') or ligand.get('name'),
-            )
-            if pdbbind_info:
-                enriched['pdbbind_affinity'] = pdbbind_info.get('affinity')
-                enriched['pdbbind_affinity_type'] = pdbbind_info.get('affinity_type')
-                evidence.append({
-                    'source': 'pdbbind',
-                    'fields': ['affinity'],
-                    'url': f"http://www.pdbbind.org.cn/?pdbid={pdb_id}",
-                })
+    # ------------------------------------------------------------------
+    # Evidence assembly
+    # ------------------------------------------------------------------
 
-        enriched['evidence'] = evidence
-        enriched['resolution_status'] = self._determine_resolution_status(enriched)
-
-        return enriched
-
-    def _determine_resolution_status(self, enriched: Dict[str, Any]) -> str:
-        """Determine ligand resolution status."""
-        if enriched.get('pubchem_cid') or enriched.get('chembl_id'):
-            return LigandResolutionStatus.RESOLVED.value
-        if enriched.get('smiles'):
-            return LigandResolutionStatus.PARTIAL.value
-        return LigandResolutionStatus.NOT_FOUND.value
-
-    def get_all_evidence(
-        self,
-        ligand: Dict[str, Any],
-        pdb_id: Optional[str] = None,
-    ) -> List[EvidenceItem]:
-        """
-        Get all available evidence items for a ligand.
-
-        Args:
-            ligand: Ligand data.
-            pdb_id: Optional PDB ID.
-
-        Returns:
-            List of evidence items.
-        """
+    def get_all_evidence(self, ligand: Dict[str, Any],
+                         pdb_id: Optional[str] = None
+                         ) -> List[EvidenceItem]:
+        """Evidence items for what sources actually provided."""
         evidence_items = []
 
-        # PubChem
         if ligand.get('pubchem_cid'):
             evidence_items.append(EvidenceItem(
                 source='pubchem',
                 field='compound_identity',
                 value={'cid': ligand['pubchem_cid']},
-                url=f"https://pubchem.ncbi.nlm.nih.gov/compound/{ligand['pubchem_cid']}",
+                url=(f"https://pubchem.ncbi.nlm.nih.gov/compound/"
+                     f"{ligand['pubchem_cid']}"),
             ))
 
-        # ChEMBL
         if ligand.get('chembl_id'):
             evidence_items.append(EvidenceItem(
                 source='chembl',
-                field='bioactivity',
+                field='compound_context',
                 value={'chembl_id': ligand['chembl_id']},
-                url=f"https://www.ebi.ac.uk/chembl/compound_report_card/{ligand['chembl_id']}",
+                url=(f"https://www.ebi.ac.uk/chembl/compound_report_card/"
+                     f"{ligand['chembl_id']}"),
             ))
 
-        # PDBBind
         if ligand.get('pdbbind_affinity'):
             evidence_items.append(EvidenceItem(
                 source='pdbbind',
                 field='binding_affinity',
-                value={'affinity': ligand['pdbbind_affinity'],
-                       'units': ligand.get('pdbbind_affinity_type', 'nM')},
+                value={'affinity': ligand['pdbbind_affinity']},
                 url=f"http://www.pdbbind.org.cn/?pdbid={pdb_id or ''}",
+            ))
+
+        if ligand.get('classification_hint'):
+            evidence_items.append(EvidenceItem(
+                source='rcsb_ccd',
+                field='component_classification',
+                value={'pdbx_type': ligand['classification_hint']},
+                url=("https://www.rcsb.org/ligands/"
+                     f"{quote(ligand.get('residue_name', '')
+                             or ligand.get('name', ''))}"),
             ))
 
         return evidence_items
 
-    def _is_cache_valid(self, key: str) -> bool:
-        """Check if cache entry is valid."""
-        if key not in self._cache_expiry:
-            return False
-        return time.time() < self._cache_expiry[key]
-
-    def _set_cache(self, key: str, value: Any):
-        """Set cache entry with TTL."""
-        config = get_config()
-        self._cache[key] = value
-        self._cache_expiry[key] = time.time() + config.cache_ttl_seconds
-
-    def clear_cache(self):
-        """Clear all cached data."""
-        self._cache.clear()
-        self._cache_expiry.clear()
+    # ------------------------------------------------------------------
+    # Health checks (real requests)
+    # ------------------------------------------------------------------
 
     def health_check(self) -> Dict[str, str]:
-        """
-        Check availability of all data sources.
-
-        Returns:
-            Dictionary of source status.
-        """
-        sources = {
-            'rscb': 'unknown',
-            'pubchem': 'unknown',
-            'chembl': 'unknown',
-            'pdbbind': 'unknown',
-        }
-
+        """Check availability of all data sources with real requests."""
+        sources = {}
         config = get_config()
 
-        # Check RCSB
-        try:
-            response = self._session.get(
-                f"{config.rcsb_base_url}/v1/health",
-                timeout=5,
-            )
-            sources['rscb'] = 'ok' if response.status_code == 200 else 'error'
-        except requests.RequestException:
-            sources['rscb'] = 'unavailable'
+        checks = {
+            'rcsb': (f"{config.rcsb_data_url}/core/entry/1CRN",
+                     lambda r: r.status_code == 200),
+            'pubchem': (
+                f"{config.pubchem_base_url}/compound/cid/702/property/"
+                f"Title/JSON",
+                lambda r: r.status_code == 200),
+            'chembl': (f"{config.chembl_base_url}/status.json",
+                       lambda r: r.status_code == 200),
+            'unichem': (
+                f"{config.unichem_base_url}/inchikey/"
+                f"LFQSCWFLJHTTHZ-UHFFFAOYSA-N",
+                lambda r: r.status_code == 200),
+        }
+        if config.pdbbind_url:
+            checks['pdbbind'] = (
+                config.pdbbind_url, lambda r: r.status_code < 500)
 
-        # Check PubChem
-        try:
-            response = self._session.get(
-                f"{config.pubchem_base_url}/rest/health",
-                timeout=5,
-            )
-            sources['pubchem'] = 'ok' if response.status_code == 200 else 'error'
-        except requests.RequestException:
-            sources['pubchem'] = 'unavailable'
-
-        # Check ChEMBL
-        try:
-            response = self._session.get(
-                f"{config.chembl_base_url}/health",
-                timeout=5,
-            )
-            sources['chembl'] = 'ok' if response.status_code == 200 else 'error'
-        except requests.RequestException:
-            sources['chembl'] = 'unavailable'
-
-        # Check PDBBind
-        try:
-            response = self._session.get(
-                f"{config.pdbbind_url}/api/v2/health",
-                timeout=5,
-            )
-            sources['pdbbind'] = 'ok' if response.status_code == 200 else 'error'
-        except requests.RequestException:
-            sources['pdbbind'] = 'unavailable'
-
+        for name, (url, ok) in checks.items():
+            # One retry: several of these services (notably UniChem) are
+            # intermittently slow; a single dropped read is a false negative.
+            # Every attempt still hits the live service - nothing is cached
+            # or assumed.
+            sources[name] = 'unavailable'
+            for _attempt in range(2):
+                try:
+                    response = self._session.get(url, timeout=5)
+                    if ok(response):
+                        sources[name] = 'ok'
+                        break
+                    sources[name] = 'error'
+                    break
+                except requests.RequestException:
+                    continue
         return sources

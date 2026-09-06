@@ -1,17 +1,26 @@
 """
 Structure parser for mmCIF and PDB files.
 
-This module parses macromolecular structure files and creates
-internal structure representations with chains, residues, atoms,
-and ligands.
+Parses macromolecular structure files into an internal representation of
+chains, residues, atoms, and non-polymer (ligand) entities.
+
+Classification policy (no local heuristics):
+- Polymer vs non-polymer status comes from the file's own _entity category
+  (entity.type == "polymer").
+- The `_atom_site.group_PDB` token (ATOM/HETATM) is part of the file itself
+  and is used to route records to the polymer or non-polymer path.
+- Every non-polymer component is surfaced as a candidate ligand. Whether a
+  candidate is solvent, an ion, or a small molecule is decided ONLY by the
+  RCSB Chemical Component Dictionary (CCD) `chem_comp.type` field, fetched
+  live and attached by the ligand resolver / enrichment layer.
+- Element symbols come from the file (`type_symbol` / columns 77-78). When a
+  file does not provide them, the CCD's authoritative atom list is consulted
+  (live); nothing is guessed from atom names.
 """
 import re
-import tempfile
-import subprocess
 import requests
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
-from io import StringIO
 
 from .schemas import (
     Structure, Chain, Residue, Atom, Ligand,
@@ -25,17 +34,9 @@ class StructureParser:
     Parse macromolecular structure files (mmCIF, PDB).
 
     Supports:
-    - Local file parsing (mmCIF primary, PDB legacy fallback)
-    - Remote fetching from RCSB (via ModelServer or download)
+    - Local file parsing (mmCIF primary, PDB legacy)
+    - Remote fetching from RCSB (files.rcsb.org download service)
     """
-
-    # _KNOWN_POLYMER_COMP is intentionally empty.
-    # The parser does not decide what is a polymer component from hardcoded name sets.
-    # Polymer / non-polymer classification comes from the entity categories in the
-    # structure file (entity_type in _entity, and the CCD pdbx_type fetched live).
-    # Everything is deferred to the enrichment client / CCD; the parser only splits
-    # atom_site into polymer residues vs non-polymer entity atoms.
-    _KNOWN_POLYMER_COMP: set = set()  # populated only by data sources, not by us
 
     def parse_mmcif(self, content: str, source_id: str = "",
                     source: str = "local") -> Structure:
@@ -53,213 +54,150 @@ class StructureParser:
         structure = Structure(id=source_id or "unknown", source=source)
         structure.file_format = "mmcif"
 
-        # Parse key-value pairs from mmCIF
         data = self._parse_mmcif_data(content)
 
-        # Extract audit category info
-        audit = data.get("_audit", {})
-        structure.title = audit.get("audit_site_id", audit.get(
-            "pdbx_description", "Unknown structure"
-        ))
+        # Title: use the file's own description fields when present.
+        title = self._get_nested_str(data, "struct.title")
+        if not title:
+            entities = self._get_loop_rows(data, "_entity")
+            for ent in entities:
+                if ent.get("type") == "polymer":
+                    desc = ent.get("pdbx_description") or ent.get("details")
+                    if desc:
+                        title = desc
+                        break
+        structure.title = title or "Unknown structure"
 
-        # Extract entity category - defines what the molecules are
-        entities = data.get("_entity", [])
-        entity_poly = data.get("_entity_poly", [])
-        entity_nonpoly = data.get("_entity_nonpoly", [])
-        entity_poly_seq = data.get("_entity_poly_seq", [])
+        # Resolution: from the file's own refine / em_3d_reconstruction /
+        # rcsb_entry_info categories when present.
+        structure.resolution = self._read_resolution(data)
+        structure.experiment_type = self._read_experiment_type(data)
 
-        # Extract assembly information
-        assemblies = data.get("_pdbx_struct_assembly", [])
+        # Entity type map from the file's own _entity table.
+        entity_type_map: Dict[str, str] = {}
+        for entity in self._get_loop_rows(data, "_entity"):
+            eid = entity.get("id")
+            etype = entity.get("type")
+            if eid is not None and etype:
+                entity_type_map[str(eid)] = str(etype)
 
-        # Build chain-to-entity mapping from pdbx_strand_entity
-        chain_to_entity: Dict[str, int] = {}
-        for strand in data.get("_pdbx_struct_assembly_entity", []):
-            chain_ids = strand.get("pdbx_polymer_entity_id", "")
-            if chain_ids:
-                for cid in chain_ids.split(","):
-                    cid = cid.strip()
-                    if cid:
-                        entity_id = strand.get("pdbx_polymer_entity_id")
-                        if entity_id:
-                            chain_to_entity[cid] = entity_id
+        # Entity -> strand mapping from _entity_poly (polymer entities).
+        polymer_strands: Dict[str, List[str]] = {}
+        entity_names: Dict[str, str] = {}
+        for entity in self._get_loop_rows(data, "_entity"):
+            eid = str(entity.get("id", ""))
+            entity_names[eid] = entity.get("entity_name") or entity.get(
+                "pdbx_description") or eid
+        for poly in self._get_loop_rows(data, "_entity_poly"):
+            eid = str(poly.get("entity_id", ""))
+            strand_list = poly.get("pdbx_strand_id") or ""
+            polymer_strands[eid] = [
+                s.strip() for s in strand_list.split(",") if s.strip()
+            ]
 
-        # Build chains
         chains: Dict[str, Chain] = {}
 
-        # Process polymer entities (proteins, nucleic acids)
-        for entity in entities:
-            entity_id = entity.get("id")
-            entity_name = entity.get("entity_name", "Unknown")
-            entity_type = entity.get("entity_type", "")
+        def _get_chain(chain_id: str, is_polymer: bool) -> Chain:
+            if chain_id not in chains:
+                chains[chain_id] = Chain(
+                    id=chain_id, name=chain_id, is_polymer=is_polymer)
+            elif is_polymer and not chains[chain_id].is_polymer:
+                chains[chain_id].is_polymer = True
+            return chains[chain_id]
 
-            # Find polymer information
-            poly_info = None
-            for poly in entity_poly:
-                if poly.get("entity_id") == entity_id:
-                    poly_info = poly
-                    break
+        # Register polymer chains from _entity_poly so they exist even if
+        # some residues have no coordinates.
+        for eid, strands in polymer_strands.items():
+            if entity_type_map.get(eid) == "polymer":
+                for sid in strands:
+                    _get_chain(sid, True)
 
-            if poly_info:
-                # This is a polymer - create chains
-                strand_id_list = poly_info.get("pdbx_strand_id", "")
-                for strand_id in strand_id_list.split(","):
-                    strand_id = strand_id.strip()
-                    if strand_id:
-                        chain = Chain(
-                            id=strand_id,
-                            name=entity_name,
-                            is_polymer=True
-                        )
-                        chains[strand_id] = chain
-
-        # Build entity type maps once so both the polymer path and the
-        # non-polymer candidate path can use the file's own entity classification.
-        entity_type_map: Dict[str, Optional[str]] = {}
-        for entity in (data.get("_entity") or []):
-            if isinstance(entity, dict):
-                eid = entity.get("id")
-                if eid is not None:
-                    entity_type_map[str(eid)] = entity.get("type") or None
-
-        asym_entity: Dict[str, Optional[str]] = {}
-        struct_asym = data.get("_struct_asym", {})
-        if isinstance(struct_asym, dict):
-            for asym_id, row in struct_asym.items():
-                if isinstance(row, dict) and "entity_id" in row:
-                    asym_entity[asym_id] = str(row["entity_id"])
-
-        # Process coordinates from _atom_site category.
-        # The parser does not decide polymer / ligand / solvent / ion status from
-        # hardcoded name lists. That classification is derived from the structure
-        # file entity categories and then enriched live by the enrichment client.
+        # Parse atom_site rows.
         atom_site = data.get("_atom_site", [])
-        current_chain: Optional[str] = None
-        current_residue: Optional[int] = None
-        current_residue_name: Optional[str] = None
-        current_chain_obj: Optional[Chain] = None
-        current_residue_obj: Optional[Residue] = None
+        if isinstance(atom_site, dict):
+            atom_site = [atom_site]
 
-        entity_comp_atoms: Dict[str, List[Atom]] = {}
+        ligand_atoms: Dict[Tuple[str, str], List[Atom]] = {}
+        serial_counter = 0
 
-        for atom_data in atom_site:
-            # Extract atom information
-            residue_name = atom_data.get("auth_comp_id") or \
-                           atom_data.get("label_comp_id", "")
-            residue_number = atom_data.get("auth_seq_id") or \
-                            atom_data.get("label_seq_id", 0)
-            atom_name = atom_data.get("auth_atom_id") or \
-                        atom_data.get("label_atom_id", "")
-            x = float(atom_data.get("Cartn_x", 0))
-            y = float(atom_data.get("Cartn_y", 0))
-            z = float(atom_data.get("Cartn_z", 0))
-            b_factor = float(atom_data.get("B_iso_or_equiv", 0))
-            occupancy = float(atom_data.get("occupancy", 1))
+        for row in atom_site:
+            group = (row.get("group_PDB") or
+                     row.get("group_pdb") or "ATOM").strip().upper()
+            atom_name = (row.get("label_atom_id") or
+                         row.get("auth_atom_id") or "").strip()
+            comp_id = (row.get("label_comp_id") or
+                       row.get("auth_comp_id") or "").strip()
+            label_asym = (row.get("label_asym_id") or "").strip()
+            auth_asym = (row.get("auth_asym_id") or "").strip()
+            chain_id = auth_asym or label_asym or " "
+            label_seq = row.get("label_seq_id")
+            auth_seq = row.get("auth_seq_id")
+            seq_token = auth_seq if auth_seq not in (None, "", ".") else label_seq
+            residue_number = self._parse_int(seq_token)
+            label_entity = str(row.get("label_entity_id", "")).strip()
 
-            chain_id = atom_data.get("auth_asym_id") or \
-                      atom_data.get("label_asym_id", " ")
-            chain_id = chain_id.strip() or "A"
+            try:
+                x = float(row.get("Cartn_x"))
+                y = float(row.get("Cartn_y"))
+                z = float(row.get("Cartn_z"))
+            except (TypeError, ValueError):
+                # Model / deuterated rows without coordinates are skipped;
+                # we only carry atoms the file actually located in space.
+                continue
 
-            asym_id = chain_id
-            entity_id = atom_data.get("label_entity_id") or atom_data.get("auth_entity_id")
+            b_factor = self._parse_float(row.get("B_iso_or_equiv"), 0.0)
+            occupancy = self._parse_float(row.get("occupancy"), 1.0)
+            element = (row.get("type_symbol") or "").strip().upper() or None
 
-            # Determine entity type from the file, not from hardcoded name lists.
-            ent_type = None
-            if entity_id is not None:
-                ent_type = entity_type_map.get(str(entity_id))
-            if ent_type is None and asym_id in asym_entity:
-                ent_type = entity_type_map.get(asym_entity[asym_id])
-
+            serial_counter += 1
             atom = Atom(
-                id=len(structure.chains) * 1000 + len(atom_site),  # rough unique ID
+                id=serial_counter,
                 name=atom_name,
-                residue_name=residue_name,
-                residue_id=int(residue_number) if residue_number else 0,
+                residue_name=comp_id,
+                residue_id=residue_number,
                 chain_id=chain_id,
                 x=x, y=y, z=z,
-                element=atom_data.get("type_symbol", "") or self._guess_element(
-                    atom_name, residue_name
-                ),
+                element=element,
                 b_factor=b_factor,
                 occupancy=occupancy,
             )
 
-            # Non-polymer / unknown entities are accumulated as candidate ligands.
-            # Polymer entities are consumed into chain/residue structure below;
-            # everything else is a candidate for ligand / solvent / ion / unknown.
-            if ent_type != "polymer":
-                entity_comp_atoms.setdefault(residue_name, [])
-                ligand_atom_name = atom_name
-                lx = x
-                ly = y
-                lz = z
-                lbf = b_factor
-                locc = occupancy
-                latom = Atom(
-                    id=len(entity_comp_atoms[residue_name]),
-                    name=ligand_atom_name,
-                    residue_name=residue_name,
-                    residue_id=int(residue_number) if residue_number else 0,
-                    chain_id=asym_id,
-                    x=lx, y=ly, z=lz,
-                    element=atom.element,
-                    b_factor=lbf,
-                    occupancy=locc,
-                )
-                entity_comp_atoms[residue_name].append(latom)
+            # Route by the file's own tokens:
+            # - ATOM records go to the polymer path.
+            # - HETATM records for entities the file declares as polymer
+            #   (e.g. modified residues) also go to the polymer path.
+            # - Everything else is a non-polymer entity (ligand candidate).
+            is_polymer_record = (
+                group == "ATOM" or entity_type_map.get(label_entity) == "polymer"
+            )
 
-            # Track current chain/residue for polymer paths
-            if chain_id != current_chain:
-                current_chain = chain_id
-                current_residue = None
-                current_residue_name = None
-
-                if chain_id not in chains:
-                    chains[chain_id] = Chain(id=chain_id, name=chain_id)
-
-                current_chain_obj = chains[chain_id]
-
-            if residue_number != current_residue or residue_name != current_residue_name:
-                current_residue = residue_number
-                current_residue_name = residue_name
-
-                # Create or find residue (polymer chains only).
-                # Non-polymer entities are handled through the ligand path, not
-                # through polymer chain residues.
+            if is_polymer_record:
+                chain = _get_chain(chain_id, True)
                 residue = next(
-                    (r for r in current_chain_obj.residues
-                     if r.id == int(residue_number) and r.name == residue_name),
+                    (r for r in chain.residues
+                     if r.id == residue_number and r.name == comp_id),
                     None
                 )
                 if residue is None:
                     residue = Residue(
-                        id=int(residue_number),
-                        name=residue_name,
+                        id=residue_number,
+                        name=comp_id,
                         chain_id=chain_id,
-                        residue_number=int(residue_number)
+                        residue_number=residue_number,
                     )
-                    current_chain_obj.residues.append(residue)
-                current_residue_obj = residue
-            else:
-                residue = current_residue_obj
-
-            # Add atom to residue
-            if residue is not None:
+                    chain.residues.append(residue)
                 residue.atoms.append(atom)
-                # Update chain reference
-                if current_chain_obj:
-                    # Find or create chain with this atom
-                    pass
+            else:
+                # Non-polymer entity: group by (component, instance chain).
+                key = (comp_id, chain_id)
+                ligand_atoms.setdefault(key, []).append(atom)
 
-        # Create candidate non-polymer objects from the structure-file groups.
-        # Names and atom groupings come from the structure file. Formula,
-        # molecular weight, SMILES, and classification are not decided here from
-        # local heuristics; those are attached later by the enrichment client / CCD.
-        for comp_id, atoms in entity_comp_atoms.items():
-            if not atoms:
-                continue
-
+        # Build candidate ligands from the file's own non-polymer groups.
+        # Identity/classification values (formula, weight, SMILES, type) are
+        # attached later by the resolver from the live CCD.
+        for (comp_id, chain_id), atoms in ligand_atoms.items():
             ligand = Ligand(
-                id=f"L{comp_id}",
+                id=f"L{comp_id}_{chain_id}" if chain_id else f"L{comp_id}",
                 name=comp_id,
                 residue_name=comp_id,
                 formula=None,
@@ -267,34 +205,14 @@ class StructureParser:
                 atom_count=len(atoms),
                 atoms=atoms,
                 resolution_status=LigandResolutionStatus.NOT_FOUND,
-                # No classification here. Deferred to enrichment client / CCD.
-                classification_hint="unclassified",
+                classification_hint=None,
             )
             structure.ligands.append(ligand)
 
-        # Set chain list from dictionary
         structure.chains = list(chains.values())
 
-        # Extract resolution from quality info
-        quality = data.get("_pdbx_quality", {})
-        if isinstance(quality, dict) and quality:
-            # Try to get resolution from any available field
-            for key in quality:
-                if 'resolution' in key.lower():
-                    try:
-                        structure.resolution = float(quality[key])
-                    except (ValueError, TypeError):
-                        pass
-                    break
-
-        # Extract experiment type
-        exp_detail = data.get("_exptl", {})
-        if isinstance(exp_detail, dict) and exp_detail:
-            structure.experiment_type = str(exp_detail.get('method', ''))
-
-        # Check for density data
-        structure.has_density = "_pdbx_vrpt" in data or \
-                                any(k.startswith("_pdbx_volray") for k in data)
+        structure.has_density = "_pdbx_vrpt" in data or any(
+            k.startswith("_pdbx_volray") for k in data)
 
         return structure
 
@@ -316,36 +234,45 @@ class StructureParser:
 
         lines = content.splitlines()
         chains: Dict[str, Chain] = {}
-        ligands: Dict[str, List[Atom]] = {}
-        current_chain: Optional[str] = None
-        current_residue: int = 0
-        current_residue_atoms: List[Atom] = []
-        current_residue_name: Optional[str] = None
+        ligand_atoms: Dict[Tuple[str, str], List[Atom]] = {}
+        # Residues are accumulated per (chain, resseq, icode, comp) so
+        # insertion codes and multi-chain files are handled correctly.
+        residues: Dict[Tuple[str, int, str, str], Residue] = {}
 
         for line in lines:
-            record_type = line[0:6].strip()
+            record = line[0:6].strip()
 
-            if record_type == "ATOM" or record_type == "HETATM":
-                # Parse PDB atom record
-                atom_serial = int(line[6:11].strip() or 0)
+            if record in ("ATOM", "HETATM"):
+                altloc = line[16:17].strip()
+                if altloc and altloc != "A":
+                    # Keep only the first alternate location per atom; the
+                    # file's altLoc column is authoritative, not a heuristic.
+                    continue
                 atom_name = line[12:16].strip()
+                # PDB name field is left-justified for element symbols
+                # starting at column 14 when the name begins with a digit
+                # (e.g. '1HG2'); for 1-char names the element sits in
+                # column 14 (index 13). When the name field contains an
+                # interior space the atom name is the first token.
+                if " " in atom_name:
+                    atom_name = atom_name.split()[0] if atom_name.split() \
+                        else atom_name
                 residue_name = line[17:20].strip()
-                chain_id = line[21:22].strip() or "A"
-                residue_number = int(line[22:26].strip() or 0)
-                x = float(line[30:38].strip() or 0)
-                y = float(line[38:46].strip() or 0)
-                z = float(line[46:54].strip() or 0)
-                b_factor = float(line[60:66].strip() or 0)
-                occupancy = float(line[54:60].strip() or 1)
-                element = line[76:78].strip() or self._guess_element(
-                    atom_name, residue_name
-                )
-
-                # Check if this is a HETATM (heteroatom/ligand)
-                is_hetatm = record_type == "HETATM"
+                chain_id = line[21:22].strip() or " "
+                residue_number = self._parse_int(line[22:26])
+                insertion_code = line[26:27].strip()
+                try:
+                    x = float(line[30:38])
+                    y = float(line[38:46])
+                    z = float(line[46:54])
+                except ValueError:
+                    continue
+                occupancy = self._parse_float(line[54:60], 1.0)
+                b_factor = self._parse_float(line[60:66], 0.0)
+                element = line[76:78].strip().upper() or None
 
                 atom = Atom(
-                    id=atom_serial,
+                    id=self._parse_int(line[6:11]),
                     name=atom_name,
                     residue_name=residue_name,
                     residue_id=residue_number,
@@ -356,97 +283,69 @@ class StructureParser:
                     occupancy=occupancy,
                 )
 
-                if is_hetatm:
-                    # This is a ligand or solvent
-                    lig_key = f"{residue_name}_{chain_id}"
-                    if lig_key not in ligands:
-                        ligands[lig_key] = []
-                    ligands[lig_key].append(atom)
+                if record == "HETATM":
+                    key = (residue_name, chain_id)
+                    ligand_atoms.setdefault(key, []).append(atom)
                 else:
-                    # Polymer atom
-                    if chain_id not in chains:
-                        chains[chain_id] = Chain(id=chain_id, name=chain_id)
+                    chain = chains.get(chain_id)
+                    if chain is None:
+                        chain = Chain(id=chain_id, name=chain_id,
+                                      is_polymer=True)
+                        chains[chain_id] = chain
+                    res_key = (chain_id, residue_number, insertion_code,
+                               residue_name)
+                    residue = residues.get(res_key)
+                    if residue is None:
+                        residue = Residue(
+                            id=residue_number,
+                            name=residue_name,
+                            chain_id=chain_id,
+                            residue_number=residue_number,
+                        )
+                        residues[res_key] = residue
+                        chain.residues.append(residue)
+                    residue.atoms.append(atom)
 
-                    chain = chains[chain_id]
-
-                    # Check if we've moved to a new residue
-                    if residue_number != current_residue or \
-                       residue_name != current_residue_name:
-                        # Save previous residue
-                        if current_residue_atoms:
-                            residue = Residue(
-                                id=current_residue,
-                                name=current_residue_name or "UNK",
-                                chain_id=chain_id,
-                                residue_number=current_residue,
-                                atoms=current_residue_atoms,
-                            )
-                            chain.residues.append(residue)
-
-                        current_residue = residue_number
-                        current_residue_name = residue_name
-                        current_residue_atoms = [atom]
+            elif record == "TITLE":
+                piece = line[10:80].rstrip()
+                if piece:
+                    # TITLE records continue across lines; PDB convention is
+                    # that continuation lines repeat no leading whitespace.
+                    if structure.title == "Unknown structure":
+                        structure.title = piece.strip()
                     else:
-                        current_residue_atoms.append(atom)
+                        existing = structure.title
+                        addition = piece.strip()
+                        if addition and not existing.endswith(addition):
+                            structure.title = existing + " " + addition
 
-            elif record_type == "TITLE":
-                title = line[10:70].strip()
-                if structure.title == "Unknown structure":
-                    structure.title = title
+            elif record == "REMARK" and line[7:10] == "   2":
+                # REMARK   2 RESOLUTION. ### ANGSTROMS.
+                m = re.search(r"RESOLUTION\.\s+([\d.]+)\s+ANGSTROM", line)
+                if m:
+                    try:
+                        structure.resolution = float(m.group(1))
+                    except ValueError:
+                        pass
 
-            elif record_type == "REMARK" and line[7:10] == "RF":
-                # Resolution
-                try:
-                    structure.resolution = float(line[13:20].strip())
-                except (ValueError, IndexError):
-                    pass
+            elif record == "EXPDTA":
+                technique = line[10:80].strip()
+                if technique:
+                    structure.experiment_type = technique
 
-            elif record_type == "KEYWDS":
-                keywords = line[10:70].strip()
-                if structure.title == "Unknown structure":
-                    structure.title = keywords[:80]
-
-        # Save last residue
-        if current_residue_atoms and current_chain:
-            chain = chains.get(current_chain)
-            if chain:
-                residue = Residue(
-                    id=current_residue,
-                    name=current_residue_name or "UNK",
-                    chain_id=current_chain,
-                    residue_number=current_residue,
-                    atoms=current_residue_atoms,
-                )
-                chain.residues.append(residue)
-
-        # Convert chain dict to list
         structure.chains = list(chains.values())
 
-        # Process ligands from HETATM records.
-        # The parser does not skip residues based on a hardcoded solvent/ion list.
-        # HETATM records can be ligands, solvent, ions, or other non-polymer
-        # entities, and the definitive classification comes from entity categories
-        # / CCD / enrichment client, not from embedded name tables here.
-        # For now, every HETATM group is surfaced as a candidate ligand.
-        for lig_key, atoms in ligands.items():
-            res_name = atoms[0].residue_name if atoms else ""
-
-            # Formula and molecular weight are not computed here from hardcoded
-            # element/weight tables. Those are derived chemical properties that come
-            # from data sources (CCD formula / formula_weight, PubChem, etc.) and are
-            # attached by the enrichment client. The parser only carries the identity
-            # it can read directly from the structure file.
+        for (comp_id, chain_id), atoms in ligand_atoms.items():
             ligand = Ligand(
-                id=lig_key,
-                name=res_name,
-                residue_name=res_name,
+                id=f"L{comp_id}_{chain_id}" if chain_id else f"L{comp_id}",
+                name=comp_id,
+                residue_name=comp_id,
                 formula=None,
                 molecular_weight=None,
                 atom_count=len(atoms),
                 atoms=atoms,
                 resolution_status=LigandResolutionStatus.NOT_FOUND,
-                # No classification here. Deferred to enrichment client / CCD.
-                classification_hint="unclassified",
+                classification_hint=None,
             )
             structure.ligands.append(ligand)
 
@@ -454,7 +353,7 @@ class StructureParser:
 
     def fetch_from_rcsb(self, pdb_id: str, format: str = "mmCIF") -> Structure:
         """
-        Fetch a structure from RCSB PDB.
+        Fetch a structure from RCSB (files.rcsb.org download service).
 
         Args:
             pdb_id: PDB ID (e.g., "1ABC") or CSM ID.
@@ -464,55 +363,28 @@ class StructureParser:
             Parsed Structure object.
         """
         config = get_config()
+        pdb_id = pdb_id.strip().upper()
 
-        # Try ModelServer first for efficient fetching
-        modelserver_url = (
-            f"{config.rcsb_base_url}/v1/model/{pdb_id}"
-        )
+        if format.upper() in ("PDB",):
+            download_url = f"{config.rcsb_files_url}/download/{pdb_id}.pdb"
+        else:
+            download_url = f"{config.rcsb_files_url}/download/{pdb_id}.cif"
 
         try:
-            # For mmCIF, use the download service
-            if format.upper() == "PDBx-MMCIF":
-                download_url = (
-                    f"https://files.rcsb.org/download/{pdb_id}.cif"
-                )
-            elif format.upper() == "PDB":
-                download_url = (
-                    f"https://files.rcsb.org/download/{pdb_id}.pdb"
-                )
-            else:
-                download_url = (
-                    f"https://files.rcsb.org/download/{pdb_id}.cif"
-                )
-
             response = requests.get(
-                download_url,
-                timeout=config.request_timeout
-            )
+                download_url, timeout=config.request_timeout)
             response.raise_for_status()
-
-            if format.upper() == "PDB":
-                return self.parse_pdb(
-                    response.text, source_id=pdb_id, source="rcsb"
-                )
-            else:
-                return self.parse_mmcif(
-                    response.text, source_id=pdb_id, source="rcsb"
-                )
-
         except requests.RequestException as e:
             raise RuntimeError(f"Failed to fetch {pdb_id} from RCSB: {e}")
 
+        if format.upper() == "PDB":
+            return self.parse_pdb(response.text, source_id=pdb_id,
+                                  source="rcsb")
+        return self.parse_mmcif(response.text, source_id=pdb_id,
+                                source="rcsb")
+
     def fetch_csm_from_rcsb(self, csm_id: str) -> Structure:
-        """
-        Fetch a Computed Structure Model from RCSB.
-
-        Args:
-            csm_id: CSM ID (e.g., "AF_AFP_1" or similar).
-
-        Returns:
-            Parsed Structure object.
-        """
+        """Fetch a Computed Structure Model from RCSB."""
         return self.fetch_from_rcsb(csm_id, format="mmCIF")
 
     def fetch_structure(self, identifier: str) -> Structure:
@@ -525,390 +397,386 @@ class StructureParser:
         Returns:
             Parsed Structure object.
         """
-        config = get_config()
-
-        # Check if it's a local file
         local_path = Path(identifier)
         if local_path.exists():
             content = local_path.read_text(encoding="utf-8")
-            if local_path.suffix.lower() in (".cif", ".mcif", ".bcif"):
+            if local_path.suffix.lower() in (".cif", ".mcif"):
                 return self.parse_mmcif(content, source_id=local_path.stem)
-            elif local_path.suffix.upper() == ".PDB":
+            if local_path.suffix.lower() == ".pdb":
                 return self.parse_pdb(content, source_id=local_path.stem)
-            else:
-                # Try mmCIF first
-                try:
-                    return self.parse_mmcif(content, source_id=local_path.stem)
-                except Exception:
-                    return self.parse_pdb(content, source_id=local_path.stem)
+            # Unknown extension: sniff the file's own content.
+            if self._looks_like_mmcif(content):
+                return self.parse_mmcif(content, source_id=local_path.stem)
+            return self.parse_pdb(content, source_id=local_path.stem)
 
-        # Otherwise try RCSB
-        # Check if it looks like a PDB ID (4 chars, starts with a digit)
-        if re.match(r'^[0-9][A-Za-z0-9]{3,4}$', identifier):
-            return self.fetch_from_rcsb(identifier)
+        if re.match(r'^[0-9][A-Za-z0-9]{3}$', identifier.strip()):
+            return self.fetch_from_rcsb(identifier.strip())
 
-        # Check if it's a CSM ID (starts with AF_ or MA_)
-        if identifier.startswith("AF_") or identifier.startswith("MA_"):
+        if identifier.startswith(("AF_", "MA_")):
             return self.fetch_csm_from_rcsb(identifier)
 
         raise ValueError(f"Unable to resolve identifier: {identifier}")
+
+    # ------------------------------------------------------------------
+    # CCD-backed element completion (data source, not heuristic)
+    # ------------------------------------------------------------------
+
+    def complete_missing_elements(self, structure: Structure) -> int:
+        """
+        Fill in missing element symbols from the RCSB CCD.
+
+        The CCD's `atoms` category is the authoritative source for each
+        component's atom types. Only atoms whose component could be resolved
+        in the CCD are updated; everything else keeps element=None and the
+        rest of the app reports it as unknown.
+
+        Returns:
+            Number of atoms updated.
+        """
+        from .ligand import ccd_element_map
+
+        updated = 0
+        components: Dict[str, Dict[str, Optional[str]]] = {}
+
+        all_atoms: List[Atom] = []
+        for chain in structure.chains:
+            for residue in chain.residues:
+                all_atoms.extend(residue.atoms)
+        for ligand in structure.ligands:
+            all_atoms.extend(ligand.atoms)
+
+        for atom in all_atoms:
+            if atom.element:
+                continue
+            comp = atom.residue_name
+            if comp not in components:
+                components[comp] = ccd_element_map(comp)
+            mapping = components[comp]
+            if mapping and atom.name in mapping and mapping[atom.name]:
+                atom.element = mapping[atom.name]
+                updated += 1
+
+        return updated
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _looks_like_mmcif(self, content: str) -> bool:
+        """Detect mmCIF by the file's own data_ header token."""
+        for line in content.splitlines()[:20]:
+            s = line.strip()
+            if s.startswith("data_"):
+                return True
+            if s.startswith(("HEADER", "ATOM  ", "HETATM", "CRYST1")):
+                return False
+        return False
+
+    def _read_resolution(self, data: Dict[str, Any]) -> Optional[float]:
+        """Read resolution from the file's own quality categories."""
+        # refine.ls_d_res_high (X-ray) - loop or scalar category
+        for row in self._get_loop_rows(data, "_refine"):
+            val = row.get("ls_d_res_high")
+            if val:
+                try:
+                    return float(val)
+                except (ValueError, TypeError):
+                    pass
+        # em_3d_reconstruction.resolution (cryo-EM)
+        for row in self._get_loop_rows(data, "_em_3d_reconstruction"):
+            val = row.get("resolution")
+            if val:
+                try:
+                    return float(val)
+                except (ValueError, TypeError):
+                    pass
+        # rcsb_entry_info.resolution_combined (loop or scalar)
+        for row in self._get_loop_rows(data, "_rcsb_entry_info"):
+            v = row.get("resolution_combined")
+            if v:
+                first = str(v).split(",")[0].strip("[]' ")
+                try:
+                    return float(first)
+                except ValueError:
+                    pass
+        return None
+
+    def _read_experiment_type(self, data: Dict[str, Any]) -> Optional[str]:
+        """Read the experimental method from the file's own _exptl table."""
+        rows = self._get_loop_rows(data, "_exptl")
+        for row in rows:
+            method = row.get("method")
+            if method:
+                return str(method)
+        return None
+
+    @staticmethod
+    def _parse_int(token) -> int:
+        """Parse an integer token; unparseable tokens yield 0."""
+        try:
+            return int(str(token).strip())
+        except (ValueError, TypeError):
+            # Strip insertion codes like "100A"
+            m = re.match(r"^(-?\d+)", str(token).strip())
+            return int(m.group(1)) if m else 0
+
+    @staticmethod
+    def _parse_float(token, default: float) -> float:
+        """Parse a float token; unparseable tokens yield the default."""
+        try:
+            return float(str(token).strip())
+        except (ValueError, TypeError):
+            return default
 
     def _parse_mmcif_data(self, content: str) -> Dict[str, Any]:
         """
         Parse mmCIF data into a nested dictionary structure.
 
-        Args:
-            content: Raw mmCIF content.
-
-        Returns:
-            Nested dictionary of categories and their data.
+        Single-value categories (``_category.field value``) are stored as
+        nested dicts; ``loop_`` tables are stored as lists of row dicts.
+        Values use the CIF conventions: ``?`` = unknown, ``.`` = null,
+        quoting with single/double quotes, and ``;``-delimited multi-line
+        text blocks.
         """
         data: Dict[str, Any] = {}
-        category_data: Dict[str, Dict[str, List[str]]] = {}
-        current_category: Optional[str] = None
+        lines = content.splitlines()
+        n = len(lines)
+        i = 0
 
-        for line in content.splitlines():
-            line = line.strip()
+        while i < n:
+            line = lines[i].strip()
+            i += 1
 
-            # Skip empty lines and comments
-            if not line or line.startswith("#"):
+            if not line or line.startswith('#') or line.startswith('data_'):
                 continue
 
-            # Category header: category_name.id
-            if line.endswith(".") and not line.startswith("_"):
-                current_category = line[:-1]
-                category_data[current_category] = {}
-                continue
+            if line == 'loop_':
+                fields: List[str] = []
+                rows: List[Dict[str, str]] = []
+                category: Optional[str] = None
 
-            # Category field
-            if line.startswith("_"):
-                # Parse field name and value(s)
-                parts = line.split(None, 1)
-                field_name = parts[0]
-                values = []
-
-                if len(parts) > 1:
-                    value_part = parts[1]
-                    # Handle semicolon-quoted values
-                    if value_part.startswith(";"):
-                        # Multi-line quoted value
-                        values = [value_part[1:]]
-                        # Note: we don't handle multi-line here for simplicity
-                    elif ";" in value_part:
-                        # Semicolon-separated list
-                        values = value_part.split(";")
-                        values = [v.strip() for v in values if v.strip()]
-                    elif "," in value_part:
-                        # Comma-separated list
-                        values = value_part.split(",")
-                        values = [v.strip() for v in values if v.strip()]
+                # Read column headers.
+                while i < n:
+                    h = lines[i].strip()
+                    if not h or h.startswith('#'):
+                        i += 1
+                        continue
+                    if h == 'loop_' or not h.startswith('_'):
+                        break
+                    col = h.split()[0]
+                    if '.' in col:
+                        cat, field = col.split('.', 1)
+                        category = cat.lstrip('_')
                     else:
-                        values = [value_part.strip()]
+                        field = col
+                        category = category or col.lstrip('_')
+                    fields.append(field)
+                    i += 1
 
-                # Get category name from field
-                if "." in field_name:
-                    cat_name = field_name.split(".")[0]
-                    if cat_name not in category_data:
-                        category_data[cat_name] = {}
-                    field_short = field_name.split(".")[1] if "." in field_name else field_name
-                    category_data[cat_name][field_short] = values
+                if not fields:
+                    continue
 
-        # Convert to nested dict
-        for cat_name, fields in category_data.items():
-            if cat_name not in data:
-                data[cat_name] = {}
+                # Read data rows using the tokenizer.
+                tokenizer = _CifLoopTokenizer(fields, rows)
+                while i < n:
+                    raw = lines[i]
+                    s = raw.strip()
+                    if s == 'loop_':
+                        break
+                    if s.startswith('_') and not tokenizer.open_quote:
+                        break
+                    if s.startswith('#') and not tokenizer.open_quote:
+                        i += 1
+                        continue
+                    i += 1
+                    tokenizer.feed(raw)
+                data['_' + category] = rows
+                continue
 
-            for field_name, values in fields.items():
-                if not isinstance(values, list):
-                    values = [values]
-                if len(values) == 1:
-                    # Single value - try to convert to appropriate type
-                    val = values[0]
-                    try:
-                        data[cat_name][field_name] = int(val)
-                    except (ValueError, TypeError):
-                        try:
-                            data[cat_name][field_name] = float(val)
-                        except (ValueError, TypeError):
-                            data[cat_name][field_name] = val
-                else:
-                    # Multiple values
-                    converted = []
-                    for val in values:
-                        try:
-                            converted.append(int(val))
-                        except (ValueError, TypeError):
-                            try:
-                                converted.append(float(val))
-                            except (ValueError, TypeError):
-                                converted.append(val)
-                    data[cat_name][field_name] = converted
+            if line.startswith('_'):
+                parts = line.split(None, 1)
+                field_full = parts[0]
+                value_raw = parts[1].strip() if len(parts) > 1 else ''
 
-        # Handle loop structures (multiple rows)
-        data["_atom_site"] = self._parse_atom_site(content)
+                cat_part, _, field_part = field_full.partition('.')
+                cat_name = cat_part.lstrip('_')
+                if not field_part:
+                    # "_field value" without a category.
+                    cat_name, field_part = field_full.lstrip('_'), 'value'
 
-        # Also parse _entity category from loop format for proper entity handling
-        data["_entity"] = self._parse_entity_category(content)
-        data["_entity_poly"] = self._parse_entity_poly_category(content)
-        data["_entity_nonpoly"] = self._parse_entity_nonpoly_category(content)
+                if value_raw.startswith(';'):
+                    # Multi-line text block: value continues until a line
+                    # that is exactly ';'.
+                    buf = [value_raw[1:]]
+                    closed = False
+                    while i < n:
+                        t = lines[i]
+                        i += 1
+                        if t.rstrip() == ';':
+                            closed = True
+                            break
+                        buf.append(t)
+                    value = '\n'.join(buf) if closed else '\n'.join(buf)
+                    data.setdefault('_' + cat_name, {})[field_part] = \
+                        self._parse_scalar(value.strip())
+                    continue
+
+                if not value_raw:
+                    # Value on following lines (quoted continuation).
+                    if i < n and lines[i].strip().startswith(';'):
+                        i += 1
+                        buf = []
+                        while i < n:
+                            t = lines[i]
+                            i += 1
+                            if t.rstrip() == ';':
+                                break
+                            buf.append(t)
+                        data.setdefault('_' + cat_name, {})[field_part] = \
+                            self._parse_scalar('\n'.join(buf).strip())
+                        continue
+                    data.setdefault('_' + cat_name, {})[field_part] = None
+                    continue
+
+                data.setdefault('_' + cat_name, {})[field_part] = \
+                    self._parse_scalar(value_raw)
+                continue
 
         return data
 
-    def _parse_entity_category(self, content: str) -> List[Dict[str, Any]]:
-        """Parse _entity category from mmCIF loops."""
-        entities = []
-        in_loop = False
-        fields = []
-        current = {}
-        field_idx = 0
+    def _tokenize_row(
+        self,
+        line: str,
+        fields: List[str],
+        rows: List[Dict[str, str]],
+        pending: List[str],
+    ) -> List[str]:
+        """Legacy single-line tokenizer entry point (kept for tests).
 
-        for line in content.splitlines():
-            line = line.strip()
-            if not line or line.startswith('#'):
-                continue
-
-            if line.startswith('_entity.'):
-                if not in_loop:
-                    in_loop = True
-                    fields = []
-                    current = {}
-                    field_idx = 0
-                field_name = line.split('.', 1)[1].split('(')[0]
-                fields.append(field_name)
-                continue
-
-            if in_loop:
-                if line.startswith('_') and not line.startswith('_entity.'):
-                    if current and fields:
-                        entities.append(current)
-                    in_loop = False
-                    continue
-
-                values = line.split()
-                for val in values:
-                    if field_idx < len(fields):
-                        current[fields[field_idx]] = val
-                        field_idx += 1
-
-                if field_idx >= len(fields):
-                    entities.append(current)
-                    current = {}
-                    field_idx = 0
-
-        if current and fields:
-            entities.append(current)
-
-        return entities
-
-    def _parse_entity_poly_category(self, content: str) -> List[Dict[str, Any]]:
-        """Parse _entity_poly category from mmCIF loops."""
-        return self._parse_entity_category(content)  # Same structure
-
-    def _parse_entity_nonpoly_category(self, content: str) -> List[Dict[str, Any]]:
-        """Parse _entity_nonpoly category from mmCIF loops."""
-        return self._parse_entity_category(content)  # Same structure
-
-    def _parse_atom_site(self, content: str) -> List[Dict[str, Any]]:
+        Feeds one physical line into a fresh tokenizer and returns the
+        still-pending token list.
         """
-        Parse the _atom_site category from mmCIF content.
+        tok = _CifLoopTokenizer(fields, rows, pending=pending)
+        tok.feed(line)
+        return tok.pending_tokens
 
-        Args:
-            content: Raw mmCIF content.
-
-        Returns:
-            List of atom data dictionaries.
-        """
-        atoms: List[Dict[str, Any]] = []
-        in_atom_site = False
-        atom_fields: List[str] = []
-        current_atom: Dict[str, str] = {}
-        field_index = 0
-
-        for line in content.splitlines():
-            line = line.strip()
-
-            if not line or line.startswith("#"):
-                continue
-
-            # Check for atom_site category start
-            if line.startswith("_atom_site."):
-                in_atom_site = True
-                field_name = line.split(".", 1)[1]
-                if "(" in field_name and ")" in field_name:
-                    # This is a loop header
-                    field_name = field_name.split("(")[0]
-                atom_fields.append(field_name)
-                current_atom = {}
-                continue
-
-            if in_atom_site:
-                # Check if this starts a new category
-                if line.startswith("_") and not line.startswith("_atom_site"):
-                    in_atom_site = False
-                    if current_atom and atom_fields:
-                        atoms.append(current_atom)
-                    continue
-
-                # Parse values for this row
-                # Handle semicolon-quoted values
-                if line.startswith(";"):
-                    value = line[1:]
-                    if value:  # Not empty
-                        if field_index < len(atom_fields):
-                            current_atom[atom_fields[field_index]] = value
-                        field_index += 1
-                    continue
-
-                # Split by whitespace (mmCIF uses whitespace in loops)
-                values = line.split()
-                for val in values:
-                    if field_index < len(atom_fields):
-                        current_atom[atom_fields[field_index]] = val
-                        field_index += 1
-
-                # Check if we have a complete atom record
-                if field_index >= len(atom_fields):
-                    atoms.append(current_atom)
-                    current_atom = {}
-                    field_index = 0
-
-        # Handle any remaining atom
-        if current_atom and atom_fields:
-            atoms.append(current_atom)
-
-        return atoms
-
-    def _is_ligand(self, residue_name: str, atom_site: List[Dict]) -> bool:
-        """
-        Determine if a residue is a ligand (non-polymer).
-        
-        The parser does not make chemical classification decisions.
-        It only skips residues that the structure file itself marks as polymer
-        components via the entity categories. Everything else is treated as
-        potentially non-polymer, and the classification comes from data sources
-        (CCD pdbx_type, PubChem, ChEMBL) through the enrichment client.
-        
-        Args:
-            residue_name: The residue/comp_id name.
-            atom_site: The atom_site data (not used here, for signature compatibility).
-
-        Returns:
-            True if this is potentially a non-polymer entity.
-        """
-        # Nothing is classified here from hardcoded knowledge.
-        # If we had a CCD-backed polymer component set, it would be used here.
-        # For now defer everything to enrichment client.
-        return True
-
-    def _guess_element(self, atom_name: str, residue_name: str) -> Optional[str]:
-        """
-        Best-effort element guess from atom name only.
-
-        This is used only as a last resort when the structure file does not
-        provide an authoritative element symbol (e.g., type_symbol). The parser
-        does not embed its own periodic-table data; for reliable element info,
-        the CCD / enrichment client should be used.
-
-        Args:
-            atom_name: The atom name (e.g., "CA", "CB", "OXT").
-            residue_name: The residue name for context.
-
-        Returns:
-            Element symbol guess, or None if unknown.
-        """
-        atom_name = atom_name.strip()
-
-        if not atom_name:
+    def _parse_scalar(self, raw: str) -> Any:
+        """Convert a single mmCIF scalar value to a Python value."""
+        s = raw.strip()
+        if s in ('', '.', '?'):
             return None
+        if (s.startswith("'") and s.endswith("'")) or \
+           (s.startswith('"') and s.endswith('"')):
+            return s[1:-1]
+        lowered = s.lower()
+        if lowered in ('true', 'yes'):
+            return True
+        if lowered in ('false', 'no'):
+            return False
+        try:
+            return int(s)
+        except ValueError:
+            pass
+        try:
+            return float(s)
+        except ValueError:
+            pass
+        return s
 
-        # Single-letter elements that are common in PDB/mmCIF atom names.
-        # This is intentionally limited and not a full periodic table.
-        single_letter_elements = {"H", "C", "N", "O", "S", "P", "F"}
+    def _get_loop_rows(self, data: Dict[str, Any],
+                       category: str) -> List[Dict[str, Any]]:
+        """Return the rows of a mmCIF category (loop or single-value)."""
+        rows = data.get(category)
+        if isinstance(rows, list):
+            return rows
+        if isinstance(rows, dict) and rows:
+            return [rows]
+        return []
 
-        # If the atom name is a single letter and it is a known element symbol,
-        # return that.
-        if len(atom_name) == 1 and atom_name.upper() in single_letter_elements:
-            return atom_name.upper()
-
-        # Multi-character names: do not guess. Return None so callers can fall
-        # back to data sources (CCD type_symbol, enrichment client) instead of
-        # embedding chemical intuition here.
+    def _get_nested_str(self, data: Dict[str, Any],
+                        dotted_key: str) -> Optional[str]:
+        """Resolve a dotted key like ``refine.ls_d_res_high``."""
+        cur: Any = data
+        for part in dotted_key.split('.'):
+            if not isinstance(cur, dict):
+                return None
+            cur = cur.get(part)
+            if cur is None:
+                return None
+        if isinstance(cur, str):
+            return cur
+        if isinstance(cur, (int, float)):
+            return str(cur)
         return None
 
-    def _compute_formula(self, atoms: List[Atom]) -> Optional[str]:
-        """
-        Compute chemical formula from atoms.
 
-        This module does not hardcode element symbols or atomic weights.
-        If the file provides an authoritative formula (e.g., from the CCD via
-        enrichment), that should be used. Without element data of known fidelity,
-        the parser cannot reliably produce a formula and returns None.
+class _CifLoopTokenizer:
+    """Stateful tokenizer for mmCIF loop data sections.
 
-        Args:
-            atoms: List of atoms.
+    Implements CIF 1.1 value quoting: a quote character delimits a value
+    only when followed by whitespace (or end of line), so embedded
+    apostrophes/quotes inside values are preserved. Values may span
+    multiple physical lines. Logical rows are emitted once one token per
+    column has accumulated.
+    """
 
-        Returns:
-            Formula string, or None if formula cannot be derived from file data alone.
-        """
-        # No hardcoded elements. Formula is a derived chemical property that
-        # should come from data sources, not from parser heuristics.
-        return None
+    def __init__(self, fields: List[str], rows: List[Dict[str, str]],
+                 pending: Optional[List[str]] = None):
+        self.fields = fields
+        self.rows = rows
+        self.tokens: List[str] = list(pending or [])
+        self.open_quote: Optional[str] = None
+        self._buf: List[str] = []
 
-    def _compute_molecular_weight(self, atoms: List[Atom]) -> Optional[float]:
-        """
-        Compute molecular weight from atoms.
+    def feed(self, line: str):
+        """Feed one physical line into the tokenizer."""
+        i = 0
+        n = len(line)
+        while i < n:
+            ch = line[i]
 
-        This module does not hardcode atomic-weight values. If authoritative
-        element/isotope/weight data is attached by the enrichment client / CCD,
-        that should be used instead of this fallback. Until then, the parser
-        cannot compute a defensible molecular weight and returns None.
+            if self.open_quote is not None:
+                # Inside a quoted value: a matching quote followed by
+                # whitespace/EOL closes the value.
+                if ch == self.open_quote and \
+                        (i + 1 >= n or line[i + 1].isspace()):
+                    self.tokens.append(''.join(self._buf))
+                    self._buf = []
+                    self.open_quote = None
+                    i += 1
+                    continue
+                self._buf.append(ch)
+                i += 1
+                continue
 
-        Args:
-            atoms: List of atoms.
+            if ch.isspace():
+                i += 1
+                continue
 
-        Returns:
-            Molecular weight in g/mol, or None if cannot compute from file data alone.
-        """
-        # No hardcoded atomic weights. Molecular weight is a derived chemical
-        # property that should come from data sources (CCD formula_weight,
-        # PubChem MolecularWeight, etc.), not from parser constants.
-        return None
+            if ch in "'\"" and (i + 1 >= n or not line[i + 1].isspace()):
+                # Opening quote of a quoted value.
+                self.open_quote = ch
+                i += 1
+                continue
 
-    def _classify_ligand(self, name: str, formula: Optional[str],
-                         mol_weight: Optional[float]) -> str:
-        """
-        Classify a ligand based on data source information.
-        
-        The classification is deferred entirely to the enrichment client / CCD.
-        The parser does not apply its own chemical heuristics.
-        
-        Args:
-            name: Ligand name/residue name (CCD ID).
-            formula: Chemical formula from CCD.
-            mol_weight: Molecular weight from CCD.
+            # Bare token: read until whitespace or an opening quote.
+            j = i
+            while j < n and not line[j].isspace() and line[j] not in "'\"":
+                j += 1
+            self.tokens.append(line[i:j])
+            i = j
 
-        Returns:
-            Classification hint from CCD or "unclassified" if not available.
-        """
-        # Defer to enrichment client / CCD.
-        # The parser itself has no opinion and applies no rules.
-        return "unclassified"
-    
-    def _get_ccd_classification(self, name: str) -> Optional[str]:
-        """
-        Get the chemical component classification from RCSB CCD.
+        self._try_emit_row()
 
-        The parser does not maintain this itself. This method exists so an
-        enrichment client / CCD-backed layer can attach the authoritative
-        pdbx_type / compound classification later. The same CCD field is
-        available in the mmCIF _chem_comp category (pdbx_type).
+    def _try_emit_row(self):
+        if self.open_quote is None and \
+                len(self.tokens) >= len(self.fields):
+            row: Dict[str, str] = {}
+            for idx, field in enumerate(self.fields):
+                row[field] = self.tokens[idx]
+            self.rows.append(row)
+            self.tokens = self.tokens[len(self.fields):]
 
-        Args:
-            name: The CCD identifier (e.g., "HEM", "ATP", "NA").
-
-        Returns:
-            The CCD-provided classification type if already resolved, otherwise None.
-        """
-        # Defer to enrichment client / CCD data.
-        # The parser does not fetch or interpret CCD by itself.
-        return None
+    @property
+    def pending_tokens(self) -> List[str]:
+        return self.tokens

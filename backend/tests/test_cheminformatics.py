@@ -66,8 +66,6 @@ class TestCheminformatics:
 
     def test_export_sdf(self):
         """Test SDF export via smiles_to_sdf."""
-        import tempfile
-        import os
         smiles = "CCO"
         sdf = self.chem.smiles_to_sdf(smiles)
         assert sdf

@@ -1,5 +1,9 @@
 """
 Tests for the contact analysis module.
+
+Contact classification is PLIP's job - the module never assigns interaction
+types from local geometry. Unit tests use constructed content; the
+end-to-end test runs real PLIP on a real RCSB structure.
 """
 
 import pytest
@@ -12,146 +16,85 @@ from ligora_backend.schemas import (
 )
 
 
+def make_structure_with_ligand() -> tuple:
+    structure = Structure(id="test", source="local")
+    chain = Chain(id="A", name="Protein", is_polymer=True)
+
+    residues_data = [
+        ("ALA", 1, [(1, "N", "N", 1.0, 1.0, 1.0),
+                    (2, "CA", "C", 2.0, 1.0, 1.0),
+                    (3, "C", "C", 3.0, 1.0, 1.0),
+                    (4, "O", "O", 4.0, 1.0, 1.0)]),
+        ("GLY", 2, [(5, "N", "N", 5.0, 1.0, 1.0),
+                    (6, "CA", "C", 6.0, 1.0, 1.0),
+                    (7, "C", "C", 7.0, 1.0, 1.0),
+                    (8, "O", "O", 8.0, 1.0, 1.0)]),
+    ]
+
+    for res_name, res_id, atoms_data in residues_data:
+        residue = Residue(id=res_id, name=res_name, chain_id="A",
+                          residue_number=res_id)
+        for atom_id, atom_name, element, x, y, z in atoms_data:
+            residue.atoms.append(Atom(
+                id=atom_id, name=atom_name, residue_name=res_name,
+                residue_id=res_id, chain_id="A",
+                x=x, y=y, z=z, element=element,
+                b_factor=30.0, occupancy=1.0))
+        chain.residues.append(residue)
+
+    structure.chains.append(chain)
+
+    ligand = Ligand(id="L1", name="Test Ligand", residue_name="LIG",
+                    atom_count=3)
+    ligand.atoms = [
+        Atom(id=1, name="C1", residue_name="LIG", residue_id=101,
+             chain_id="A", x=4.0, y=1.0, z=1.0, element="C"),
+        Atom(id=2, name="O1", residue_name="LIG", residue_id=101,
+             chain_id="A", x=5.0, y=1.0, z=1.0, element="O"),
+        Atom(id=3, name="N1", residue_name="LIG", residue_id=101,
+             chain_id="A", x=6.0, y=1.0, z=1.0, element="N"),
+    ]
+    structure.ligands.append(ligand)
+    return structure, ligand
+
+
 class TestContactAnalyzer:
     """Tests for the ContactAnalyzer class."""
 
     def setup_method(self):
-        """Set up test fixtures."""
         self.analyzer = ContactAnalyzer()
 
-    def create_test_structure(self):
-        """Create a simple test structure."""
-        structure = Structure(id="test", source="local")
-
-        # Create a protein chain
-        chain = Chain(id="A", name="Protein", is_polymer=True)
-
-        # Add residues
-        residues_data = [
-            ("ALA", 1, [(1, "N", "N", 1.0, 1.0, 1.0),
-                       (2, "CA", "C", 2.0, 1.0, 1.0),
-                       (3, "C", "C", 3.0, 1.0, 1.0),
-                       (4, "O", "O", 4.0, 1.0, 1.0)]),
-            ("ALA", 2, [(5, "N", "N", 5.0, 1.0, 1.0),
-                       (6, "CA", "C", 6.0, 1.0, 1.0),
-                       (7, "C", "C", 7.0, 1.0, 1.0),
-                       (8, "O", "O", 8.0, 1.0, 1.0)]),
-            ("GLY", 3, [(9, "N", "N", 9.0, 1.0, 1.0),
-                       (10, "CA", "C", 10.0, 1.0, 1.0),
-                       (11, "C", "C", 11.0, 1.0, 1.0),
-                       (12, "O", "O", 12.0, 1.0, 1.0)]),
-        ]
-
-        for res_name, res_id, atoms_data in residues_data:
-            residue = Residue(id=res_id, name=res_name, chain_id="A", residue_number=res_id)
-            for atom_id, atom_name, element, x, y, z in atoms_data:
-                atom = Atom(
-                    id=atom_id, name=atom_name, residue_name=res_name,
-                    residue_id=res_id, chain_id="A",
-                    x=x, y=y, z=z, element=element,
-                    b_factor=30.0, occupancy=1.0
-                )
-                residue.atoms.append(atom)
-            chain.residues.append(residue)
-
-        structure.chains.append(chain)
-
-        # Create a ligand near the protein
-        ligand = Ligand(
-            id="L1",
-            name="Test Ligand",
-            residue_name="LIG",
-            formula="C6H6O",
-            atom_count=3,
-        )
-
-        ligand.atoms = [
-            Atom(id=1, name="C1", residue_name="LIG", residue_id=1,
-                 chain_id="L", x=4.0, y=1.0, z=1.0, element="C"),
-            Atom(id=2, name="O1", residue_name="LIG", residue_id=1,
-                 chain_id="L", x=5.0, y=1.0, z=1.0, element="O"),
-            Atom(id=3, name="N1", residue_name="LIG", residue_id=1,
-                 chain_id="L", x=6.0, y=1.0, z=1.0, element="N"),
-        ]
-
-        structure.ligands.append(ligand)
-        return structure, ligand
-
-    def test_geometric_contacts_require_external_type(self):
-        """Test that geometric analysis no longer assigns contact types.
-
-        Contact type must come from an external source (for example PLIP)
-        or be supplied by the caller. The module no longer assigns types
-        from local distance/element heuristics.
-        """
-        structure, ligand = self.create_test_structure()
-
-        protein_oxygen = Atom(
-            id=100, name="O", residue_name="ALA", residue_id=1,
-            chain_id="A", x=4.5, y=1.0, z=1.0, element="O"
-        )
-        structure.chains[0].residues[0].atoms.append(protein_oxygen)
-
-        contacts = self.analyzer._geometric_analysis(
-            structure.chains[0].residues[0].atoms,
-            ligand.atoms,
-            ligand,
-            structure
-        )
-
-        # Any returned contact must not be locally classified.
-        for contact in contacts:
-            assert contact.contact_type == ContactType.UNKNOWN
-
-    def test_geometric_hydrophobic_contact_is_not_locally_classified(self):
-        """Test that hydrophobic contacts are not locally classified.
-
-        Hydrophobic contact type must come from an external source.
-        """
-        structure, ligand = self.create_test_structure()
-
-        protein_carbon = Atom(
-            id=100, name="CB", residue_name="ALA", residue_id=1,
-            chain_id="A", x=4.5, y=1.5, z=1.5, element="C"
-        )
-        structure.chains[0].residues[0].atoms.append(protein_carbon)
-
-        contacts = self.analyzer._geometric_analysis(
-            structure.chains[0].residues[0].atoms,
-            ligand.atoms,
-            ligand,
-            structure
-        )
-
-        # No local hydrophobic classification.
-        for contact in contacts:
-            assert contact.contact_type == ContactType.UNKNOWN
+    def test_plip_availability_reported(self):
+        # Availability must be a real check, whatever the environment has.
+        assert isinstance(self.analyzer.is_plip_available(), bool)
 
     def test_compute_binding_pocket(self):
-        """Test binding pocket computation."""
-        structure, ligand = self.create_test_structure()
-
-        pocket = self.analyzer.compute_binding_pocket(structure, ligand, radius=6.0)
-
+        structure, ligand = make_structure_with_ligand()
+        pocket = self.analyzer.compute_binding_pocket(structure, ligand,
+                                                      radius=6.0)
         assert "ligand_center" in pocket
         assert "radius" in pocket
         assert "pocket_chain_ids" in pocket
         assert "pocket_residue_count" in pocket
-
-        # Ligand center should be computed
+        assert pocket["pocket_residue_count"] >= 1
         center = pocket["ligand_center"]
-        assert "x" in center
-        assert "y" in center
-        assert "z" in center
+        assert {"x", "y", "z"} <= set(center)
+
+    def test_compute_binding_pocket_radius_selects(self):
+        structure, ligand = make_structure_with_ligand()
+        near = self.analyzer.compute_binding_pocket(structure, ligand,
+                                                    radius=3.0)
+        far = self.analyzer.compute_binding_pocket(structure, ligand,
+                                                   radius=0.5)
+        assert near["pocket_residue_count"] >= far["pocket_residue_count"]
 
     def test_export_contacts_csv(self):
-        """Test CSV export of contacts."""
         contacts = [
             Contact(
-                id=1,
+                id=0,
                 ligand_atom="C1",
                 ligand_residue_name="LIG",
-                ligand_residue_id=1,
+                ligand_residue_id=101,
                 ligand_chain_id="L",
                 protein_residue_name="ALA",
                 protein_residue_id=1,
@@ -160,42 +103,21 @@ class TestContactAnalyzer:
                 distance=2.5,
                 contact_type=ContactType.HYDROGEN_BOND,
                 angle=150.0,
-                description="H-bond between ALA and LIG",
-            ),
-            Contact(
-                id=2,
-                ligand_atom="C2",
-                ligand_residue_name="LIG",
-                ligand_residue_id=1,
-                ligand_chain_id="L",
-                protein_residue_name="GLY",
-                protein_residue_id=2,
-                protein_chain_id="A",
-                protein_atom="CA",
-                distance=3.5,
-                contact_type=ContactType.HYDROPHOBIC,
-                description="Hydrophobic contact",
+                description="donor/acceptor",
             ),
         ]
-
         output_path = Path("/tmp/test_contacts.csv")
         self.analyzer.export_contacts_csv(contacts, output_path)
-
-        # Verify file was created
-        assert output_path.exists()
-
-        # Read and verify content
         content = output_path.read_text()
         assert "ligand_atom" in content
         assert "protein_atom" in content
         assert "distance" in content
-
-        # Cleanup
+        assert "hydrogen_bond" in content
         output_path.unlink()
 
     def test_compute_ligand_center(self):
-        """Test ligand center computation."""
-        ligand = Ligand(id="L1", name="Test", residue_name="LIG", atom_count=3)
+        ligand = Ligand(id="L1", name="Test", residue_name="LIG",
+                        atom_count=3)
         ligand.atoms = [
             Atom(id=1, name="C1", residue_name="LIG", residue_id=1,
                  chain_id="L", x=1.0, y=2.0, z=3.0, element="C"),
@@ -204,36 +126,52 @@ class TestContactAnalyzer:
             Atom(id=3, name="C3", residue_name="LIG", residue_id=1,
                  chain_id="L", x=5.0, y=6.0, z=7.0, element="C"),
         ]
-
         center = self.analyzer._compute_ligand_center(ligand)
-
-        # Center should be average of positions
         assert np.allclose(center, [3.0, 4.0, 5.0])
 
-    def test_classify_by_geometry_returns_unknown(self):
-        """Test geometry-based classification returns UNKNOWN.
+    def test_analyze_without_plip_honest(self):
+        """No contacts may be fabricated when PLIP is missing."""
+        structure, ligand = make_structure_with_ligand()
+        if self.analyzer.is_plip_available():
+            pytest.skip("PLIP is installed; the unavailable path is moot")
+        contacts, available = self.analyzer.analyze_contacts(
+            structure, ligand)
+        assert contacts == []
+        assert available is False
 
-        The module no longer classifies contacts from local geometry.
-        Contact type must come from an external source or the caller.
-        """
-        analyzer = self.analyzer
+    def test_analyze_real_plip_on_real_structure(self):
+        """End-to-end: real RCSB structure, real PLIP run, real contacts."""
+        if not self.analyzer.is_plip_available():
+            pytest.skip("PLIP is not installed")
 
-        # Hydrogen bond (short distance, N/O atoms)
-        result = analyzer._classify_by_geometry(2.8, "N", "O")
-        assert result == ContactType.UNKNOWN
+        import requests
+        from ligora_backend.parser import StructureParser
 
-        # Hydrophobic (carbon atoms, medium distance)
-        result = analyzer._classify_by_geometry(3.8, "C", "C")
-        assert result == ContactType.UNKNOWN
+        response = requests.get(
+            "https://files.rcsb.org/download/3W85.cif", timeout=60)
+        assert response.status_code == 200
+        structure = StructureParser().parse_mmcif(
+            response.text, source_id="3W85", source="rcsb")
 
-        # No contact (too far)
-        result = analyzer._classify_by_geometry(6.0, "C", "C")
-        assert result == ContactType.UNKNOWN
+        ligand = next(
+            lig for lig in structure.ligands
+            if lig.residue_name == "W85" and len(lig.atoms) == 23)
+        for a in ligand.atoms:
+            assert a.element  # elements required by the PDB writer
 
-        # Van der Waals (medium distance C-C)
-        result = analyzer._classify_by_geometry(3.0, "C", "C")
-        assert result == ContactType.UNKNOWN
+        contacts, available = self.analyzer.analyze_contacts(
+            structure, ligand)
+        assert available is True
+        # W85 makes real hydrogen bonds / hydrophobic contacts in 3W85.
+        assert len(contacts) > 0
+        types = {c.contact_type for c in contacts}
+        known = {t for t in types if t != ContactType.UNKNOWN}
+        assert known  # PLIP classified at least one interaction
+        for c in contacts:
+            assert 0 < c.distance < 10
+            assert c.protein_residue_name
+            assert c.description
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+    pytest.main([__file__])

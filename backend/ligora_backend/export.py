@@ -10,22 +10,15 @@ Provides:
 
 import json
 import csv
-import shutil
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
-
-import numpy as np
 
 from .schemas import (
     Structure,
     Ligand,
     Contact,
-    EvidenceItem,
     AnalysisSummary,
-    DockingResult,
-    GeometryCleanupResult,
-    Atom,
 )
 
 
@@ -56,22 +49,25 @@ class ArtifactExporter:
             ligand_smiles=ligand.smiles,
             resolution_status=str(ligand.resolution_status),
             contact_count=len(contacts),
-            contacts=[{
-                'id': c.id,
-                'ligand_atom': c.ligand_atom,
-                'ligand_residue': c.ligand_residue_name,
-                'ligand_residue_id': c.ligand_residue_id,
-                'ligand_chain': c.ligand_chain_id,
-                'protein_atom': c.protein_atom,
-                'protein_residue': c.protein_residue_name,
-                'protein_residue_id': c.protein_residue_id,
-                'protein_chain': c.protein_chain_id,
-                'distance': c.distance,
-                'contact_type': str(c.contact_type),
-                'angle': c.angle,
-                'water_mediated': c.is_water_mediated,
-                'description': c.description,
-            } for c in contacts],
+            contacts=[
+                c if isinstance(c, dict) else {
+                    'id': c.id,
+                    'ligand_atom': c.ligand_atom,
+                    'ligand_residue': c.ligand_residue_name,
+                    'ligand_residue_id': c.ligand_residue_id,
+                    'ligand_chain': c.ligand_chain_id,
+                    'protein_atom': c.protein_atom,
+                    'protein_residue': c.protein_residue_name,
+                    'protein_residue_id': c.protein_residue_id,
+                    'protein_chain': c.protein_chain_id,
+                    'distance': c.distance,
+                    'contact_type': str(c.contact_type),
+                    'angle': c.angle,
+                    'water_mediated': c.is_water_mediated,
+                    'description': c.description,
+                }
+                for c in contacts
+            ],
             evidence=evidence,
             job_results=job_results,
             notes=notes,
@@ -142,42 +138,18 @@ class ArtifactExporter:
         ligand: Ligand,
         output_path: Path,
     ) -> Path:
-        """Export ligand to SDF format."""
-        lines = []
-        mol_name = ligand.name or ligand.residue_name or 'LIG'
-        lines.append(mol_name[:80].ljust(80))
-        lines.append(''.ljust(80))
-        n_atoms = len(ligand.atoms)
-        n_bonds = max(0, n_atoms - 1)
-        lines.append(f'{n_atoms:>3} {n_bonds:>3}'.ljust(16))
-        lines.append(''.ljust(80))
-        lines.append(''.ljust(80))
-        lines.append(''.ljust(80))
+        """Export ligand to SDF with real perceived bonds via RDKit.
 
-        for i, atom in enumerate(ligand.atoms):
-            elem = (atom.element or 'C').strip()
-            atomic_num = self._atomic_number(elem)
-            x, y, z = atom.x, atom.y, atom.z
-            lines.append(
-                f'{atomic_num:>3} {elem:<2} {x:>10.4f} {y:>10.4f} {z:>10.4f}'
-                f'    0.0000           0'
-            )
-
-        for i in range(1, n_atoms):
-            lines.append(f'{i:>3} {i+1:>3} {1:>3}')
-
-        lines.append('$$$$')
-
+        Bond orders come from RDKit's own perception (geometry + CCD-
+        derived hydrogens); no placeholder bonds are written. Raises
+        when a chemically valid molecule cannot be built, rather than
+        emitting a bondless file that misrepresents the chemistry.
+        """
+        from .cheminformatics import Cheminformatics
+        sdf_text = Cheminformatics().atoms_to_sdf(ligand)
         with open(output_path, 'w') as f:
-            f.write('\n'.join(lines))
-
+            f.write(sdf_text)
         return output_path
-
-    def _atomic_number(self, symbol: str) -> int:
-        # No local periodic-table lookup is used here.
-        # Any atomic-number mapping must come from an external data source
-        # (for example the CCD/element metadata), not from a hardcoded table.
-        return -1
 
     def export_full_artifact(
         self,
@@ -192,8 +164,6 @@ class ArtifactExporter:
         output_dir.mkdir(parents=True, exist_ok=True)
 
         self.save_analysis_summary(session_id, summary, output_dir / 'analysis_summary.json')
-        contacts_path = output_dir / 'contacts.csv'
-        self.export_contacts_csv(summary.contacts, contacts_path)
 
         return output_dir
 

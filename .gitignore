@@ -19,3 +19,11 @@ Thumbs.db
 
 # Backend local virtualenv if created under the backend tree
 backend/.venv/
+
+# Frontend build output and Vite cache
+frontend/dist/
+frontend/node_modules/.vite/
+
+# Tauri/Rust build artifacts
+frontend/src-tauri/target/
+frontend/src-tauri/gen/

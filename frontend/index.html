@@ -161,6 +161,87 @@
                 </div>
             </div>
         </div>
+        <div class="v2-dock" id="v2-dock">
+            <div class="v2-tabs">
+                <button class="v2-tab" data-tab="batch">Batch</button>
+                <button class="v2-tab" data-tab="water">Water Network</button>
+                <button class="v2-tab" data-tab="editor">2D Editor</button>
+                <button class="v2-tab" data-tab="script">Console</button>
+                <button class="v2-tab" data-tab="compare">Compare</button>
+            </div>
+            <div class="v2-panel v2-hidden" id="v2-panel-batch">
+                <div class="v2-row">
+                    <input class="input" id="batch-sources" type="text"
+                        placeholder="PDB IDs or file paths, comma separated (e.g. 3W85, 4HHB)">
+                </div>
+                <div class="v2-row v2-actions">
+                    <button class="btn btn-primary" id="btn-batch-run">Run Batch</button>
+                    <button class="btn btn-secondary" id="btn-batch-export">Export Results</button>
+                </div>
+                <div class="v2-progress" id="batch-progress" style="display:none">
+                    <div class="v2-progress-bar"><div class="v2-progress-fill" id="batch-progress-fill"></div></div>
+                    <span class="v2-progress-text" id="batch-progress-text"></span>
+                </div>
+                <div class="v2-results" id="batch-results">
+                    <div class="v2-placeholder">Enter PDB IDs or file paths, then Run Batch. Each entry runs real PLIP contact analysis + live ligand enrichment.</div>
+                </div>
+            </div>
+            <div class="v2-panel v2-hidden" id="v2-panel-water">
+                <div class="v2-row v2-actions">
+                    <button class="btn btn-primary" id="btn-water-analyze">Analyze Water Network</button>
+                </div>
+                <div class="v2-results" id="water-results">
+                    <div class="v2-placeholder">Loads a structure first. Waters are identified from the RCSB CCD classification of the structure's own components.</div>
+                </div>
+            </div>
+            <div class="v2-panel v2-hidden" id="v2-panel-editor">
+                <div class="v2-row v2-actions">
+                    <button class="btn btn-secondary" id="btn-editor-load">Load Selected Ligand</button>
+                    <button class="btn btn-primary" id="btn-editor-export">Export SDF</button>
+                </div>
+                <div class="v2-row editor-toolbar">
+                    <select class="select" id="editor-element">
+                        <option value="C">C</option><option value="N">N</option>
+                        <option value="O">O</option><option value="S">S</option>
+                        <option value="P">P</option><option value="F">F</option>
+                        <option value="Cl">Cl</option><option value="Br">Br</option>
+                    </select>
+                    <button class="btn btn-secondary btn-sm" id="btn-editor-add-atom">+ Atom</button>
+                    <button class="btn btn-secondary btn-sm" id="btn-editor-del-atom">- Atom</button>
+                    <select class="select" id="editor-bond-order">
+                        <option value="1">single</option>
+                        <option value="2">double</option>
+                        <option value="3">triple</option>
+                    </select>
+                    <button class="btn btn-secondary btn-sm" id="btn-editor-add-bond">+ Bond</button>
+                    <button class="btn btn-secondary btn-sm" id="btn-editor-del-bond">- Bond</button>
+                </div>
+                <canvas id="editor-canvas" width="328" height="240"></canvas>
+                <div class="v2-results" id="editor-info">
+                    <div class="v2-placeholder">Loads the selected ligand with real CCD bond orders; edits are exported to a valid SDF.</div>
+                </div>
+            </div>
+            <div class="v2-panel v2-hidden" id="v2-panel-script">
+                <textarea class="script-input" id="script-input" rows="5"
+                    placeholder="Python, e.g.:&#10;print(structure.id)&#10;print(selected_ligand_id)"></textarea>
+                <div class="v2-row v2-actions">
+                    <button class="btn btn-primary" id="btn-script-run">Run</button>
+                </div>
+                <pre class="script-output" id="script-output"># Console has access to: structure, selected_ligand_id, session_id</pre>
+            </div>
+            <div class="v2-panel v2-hidden" id="v2-panel-compare">
+                <div class="v2-row">
+                    <select class="select" id="compare-job-a"><option value="">Job A...</option></select>
+                    <select class="select" id="compare-job-b"><option value="">Job B...</option></select>
+                </div>
+                <div class="v2-row v2-actions">
+                    <button class="btn btn-primary" id="btn-compare-run">Compare Poses</button>
+                </div>
+                <div class="v2-results" id="compare-results">
+                    <div class="v2-placeholder">Run two Vina docking jobs first, then compare their poses (RMSD + affinity).</div>
+                </div>
+            </div>
+        </div>
     </div>
     <script type="module" src="src/main.js"></script>
 </body>
