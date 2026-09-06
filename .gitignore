@@ -1,0 +1,21 @@
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# Local virtual environments used for development/testing
+.venv/
+venv/
+env/
+
+# Test and build caches
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Editor/OS files
+.DS_Store
+Thumbs.db
+
+# Backend local virtualenv if created under the backend tree
+backend/.venv/
