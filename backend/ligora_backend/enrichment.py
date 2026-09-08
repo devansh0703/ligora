@@ -20,6 +20,7 @@ import requests
 
 from .schemas import EvidenceItem
 from .config import get_config
+from .net import http_timeout
 
 
 class EnrichmentClient:
@@ -69,7 +70,7 @@ class EnrichmentClient:
             url = f"{config.rcsb_data_url}/core/entry/{pdb_id}"
             try:
                 response = self._session.get(
-                    url, timeout=config.request_timeout)
+                    url, timeout=http_timeout(config.request_timeout))
                 if response.status_code != 200:
                     return None
                 data = response.json()
@@ -119,7 +120,7 @@ class EnrichmentClient:
                    f"{quote(residue_name)}")
             try:
                 response = self._session.get(
-                    url, timeout=config.request_timeout)
+                    url, timeout=http_timeout(config.request_timeout))
                 if response.status_code != 200:
                     return None
                 cc = (response.json().get('chem_comp') or {})
@@ -155,7 +156,8 @@ class EnrichmentClient:
         url = (f"{config.pubchem_base_url}/compound/cid/{cid}/"
                f"property/{fields}/JSON")
         try:
-            response = self._session.get(url, timeout=config.request_timeout)
+            response = self._session.get(
+                url, timeout=http_timeout(config.request_timeout))
             if response.status_code != 200:
                 return None
             props = response.json().get('PropertyTable', {}).get(
@@ -182,7 +184,7 @@ class EnrichmentClient:
                        f"{quote(compound_name)}/cids/JSON")
                 try:
                     resp = self._session.get(
-                        url, timeout=config.request_timeout)
+                        url, timeout=http_timeout(config.request_timeout))
                     if resp.status_code == 200:
                         cids = resp.json().get('IdentifierList', {}).get(
                             'CID', [])
@@ -196,7 +198,7 @@ class EnrichmentClient:
                        f"{quote(smiles)}/cids/JSON")
                 try:
                     resp = self._session.get(
-                        url, timeout=config.request_timeout)
+                        url, timeout=http_timeout(config.request_timeout))
                     if resp.status_code == 200:
                         cids = resp.json().get('IdentifierList', {}).get(
                             'CID', [])
@@ -240,27 +242,37 @@ class EnrichmentClient:
         return None
 
     def _get_chembl_id_from_unichem(self, inchi_key: str) -> Optional[str]:
-        """Map an InChIKey to a ChEMBL ID via the UniChem service."""
+        """Map an InChIKey to a ChEMBL ID via the UniChem service.
+
+        A transient timeout is retried once (same policy as the status
+        checks) before being reported as unavailable — a slow EBI moment
+        must not be misreported as 'no mapping exists'.
+        """
         config = get_config()
         url = f"{config.unichem_base_url}/inchikey/{inchi_key}"
-        try:
-            resp = self._session.get(url, timeout=config.request_timeout)
-            if resp.status_code != 200:
+        for attempt in range(2):
+            try:
+                resp = self._session.get(
+                    url, timeout=http_timeout(config.request_timeout))
+                if resp.status_code != 200:
+                    return None
+                mappings = resp.json()
+                if isinstance(mappings, list):
+                    for m in mappings:
+                        if str(m.get('src_id')) == '1':  # 1 = ChEMBL
+                            return m.get('src_compound_id')
                 return None
-            mappings = resp.json()
-            if isinstance(mappings, list):
-                for m in mappings:
-                    if str(m.get('src_id')) == '1':  # 1 = ChEMBL
-                        return m.get('src_compound_id')
-        except (requests.RequestException, ValueError):
-            pass
+            except (requests.RequestException, ValueError):
+                if attempt == 1:
+                    return None
         return None
 
     def _get_chembl_by_id(self, chembl_id: str) -> Optional[Dict[str, Any]]:
         config = get_config()
         url = f"{config.chembl_base_url}/molecule/{chembl_id}.json"
         try:
-            response = self._session.get(url, timeout=config.request_timeout)
+            response = self._session.get(
+                url, timeout=http_timeout(config.request_timeout))
             if response.status_code != 200:
                 return None
             molecule = (response.json().get('molecule') or {})
@@ -287,7 +299,8 @@ class EnrichmentClient:
         url = (f"{config.chembl_base_url}/similarity/"
                f"{quote(smiles)}/70.json?limit=1")
         try:
-            response = self._session.get(url, timeout=config.request_timeout)
+            response = self._session.get(
+                url, timeout=http_timeout(config.request_timeout))
             if response.status_code != 200:
                 return None
             molecules = response.json().get('molecules', [])
@@ -313,7 +326,8 @@ class EnrichmentClient:
                f"molecule_chembl_id={chembl_id}&limit={limit}")
         activities: List[Dict[str, Any]] = []
         try:
-            response = self._session.get(url, timeout=config.request_timeout)
+            response = self._session.get(
+                url, timeout=http_timeout(config.request_timeout))
             if response.status_code != 200:
                 return activities
             for activity in response.json().get('activities', []):
@@ -409,12 +423,14 @@ class EnrichmentClient:
         for name, (url, ok) in checks.items():
             # One retry: several of these services (notably UniChem) are
             # intermittently slow; a single dropped read is a false negative.
-            # Every attempt still hits the live service - nothing is cached
-            # or assumed.
+            # A longer-than-usual per-attempt timeout avoids marking a busy
+            #-but-alive service unavailable right after the app has issued
+            # many other live calls. Every attempt still hits the live
+            # service - nothing is cached or assumed.
             sources[name] = 'unavailable'
             for _attempt in range(2):
                 try:
-                    response = self._session.get(url, timeout=5)
+                    response = self._session.get(url, timeout=15)
                     if ok(response):
                         sources[name] = 'ok'
                         break

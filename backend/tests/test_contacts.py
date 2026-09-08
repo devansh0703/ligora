@@ -130,14 +130,22 @@ class TestContactAnalyzer:
         assert np.allclose(center, [3.0, 4.0, 5.0])
 
     def test_analyze_without_plip_honest(self):
-        """No contacts may be fabricated when PLIP is missing."""
+        """No contacts may be fabricated when PLIP is missing.
+
+        PLIP is installed here, so the unavailable path is exercised by
+        pointing the analyzer's config at a provably nonexistent binary —
+        the same code path a real absence takes."""
+        from ligora_backend import config as config_module
         structure, ligand = make_structure_with_ligand()
-        if self.analyzer.is_plip_available():
-            pytest.skip("PLIP is installed; the unavailable path is moot")
-        contacts, available = self.analyzer.analyze_contacts(
-            structure, ligand)
-        assert contacts == []
-        assert available is False
+        config_module.get_config().plip_executable = "/nonexistent/plip"
+        try:
+            analyzer = ContactAnalyzer()
+            contacts, available = analyzer.analyze_contacts(
+                structure, ligand)
+            assert contacts == []
+            assert available is False
+        finally:
+            config_module.reset_config()
 
     def test_analyze_real_plip_on_real_structure(self):
         """End-to-end: real RCSB structure, real PLIP run, real contacts."""

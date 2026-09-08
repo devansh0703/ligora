@@ -6,21 +6,23 @@ description: |
   analysis built on open data sources and open engines.
 
   Features:
-  - Open and visualize PDB/mmCIF structures (3Dmol.js viewer)
+  - Open and visualize PDB/mmCIF, mol2, SDF/MOL, XYZ, GRO and PDBQT files
   - Real protein-ligand contact analysis via PLIP
   - Molecular docking with AutoDock Vina
+  - GROMACS minimization / short-MD snippets
+  - Pocket detection (fpocket) and DSSP secondary structure
   - Real geometry cleanup and PDBQT preparation via Open Babel
-  - Live ligand enrichment from RCSB CCD, PubChem, ChEMBL and UniChem
+  - Live ligand enrichment from RCSB CCD, PubChem, ChEMBL, UniChem, BindingDB
   - Batch analysis, water networks, 2D editor, scripting console
-  - Export analysis artifacts (JSON summary, contacts CSV, ligand SDF)
+  - Export analysis artifacts (JSON summary, contacts CSV, ligand SDF,
+    mmCIF struct_conn, reproducibility manifest)
 
 grade: stable
 confinement: strict
 base: core22
 
 architectures:
-  - build-on: amd64
-    run-on: amd64
+  - amd64
 
 apps:
   ligora:
@@ -97,6 +99,14 @@ parts:
       - autodock-vina
       - plip
       - openbabel
+      # MD minimization / short-MD snippets (gmx; user-configurable via
+      # LIGORA_GMX_PATH, discovered on PATH by default).
+      - gromacs
+      # Secondary-structure assignment (provides mkdssp).
+      - dssp
+      # fpocket is NOT in Ubuntu repositories: it needs an upstream build
+      # (e.g. a staged part from source or the fpocket snap). Until then
+      # the pockets feature reports fpocket as unavailable - honestly.
       # Runtime libraries the engines and GUI need.
       - libxml2
       - zlib1g

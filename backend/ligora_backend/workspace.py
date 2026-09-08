@@ -40,6 +40,7 @@ class Session:
     jobs: Dict[str, Job] = field(default_factory=dict)
     active_job_id: Optional[str] = None
     notes: str = ""
+    docking_box: Optional[Dict[str, Any]] = None
     created_at: str = ""
     workspace_path: str = ""
 

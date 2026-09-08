@@ -137,24 +137,13 @@ class WaterNetworkAnalyzer:
         return waters
 
     def _is_water(self, residue) -> bool:
-        """Decide whether a residue is water based on caller-supplied names.
+        """Decide whether a residue is water from the caller-supplied set.
 
-        When no water names are configured, this falls back to checking
-        whether the residue's atoms are all oxygen (the structure file's
-        element data is the source of that decision, not a local list).
+        The set itself is derived from the CCD's classification of the
+        structure's own components (pdbx_type == HETAS = solvent); no local
+        heuristic is applied here.
         """
-        if self.water_names:
-            return residue.name in self.water_names
-        # No configured names: use element data from the structure file.
-        # A water-like residue has at least one oxygen and no heavy non-oxygen
-        # atoms beyond typical water hydrogens.
-        if not residue.atoms:
-            return False
-        elements = [a.element for a in residue.atoms if a.element]
-        if not elements:
-            return False
-        non_oxygen = [e for e in elements if e.upper() not in ('O', 'H')]
-        return 'O' in [e.upper() for e in elements] and not non_oxygen
+        return residue.name in self.water_names
 
     def _compute_center(self, atoms: List[Atom]) -> List[float]:
         """Compute the geometric center of a set of atoms.

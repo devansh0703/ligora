@@ -81,9 +81,11 @@ try {
   await shot('10-compare')
 
   console.log('== Batch tab with a real second structure ==')
+  // 1UBQ has no ligand at all (ubiquitin), which would honestly fail;
+  // use a ligand-bearing structure for a successful batch run.
   await page.evaluate(() => document.querySelector('[data-tab="batch"]').click())
   await page.click('#batch-sources')
-  await page.type('#batch-sources', '1UBQ')
+  await page.type('#batch-sources', '1HRC')
   await page.click('#btn-batch-run')
   await waitFor(async () => (await count('#batch-results tbody tr')) > 0,
     280000, 'batch results render')
@@ -91,7 +93,7 @@ try {
   rep.ok(/1 succeeded/.test(batch || ''), `batch summary: ${batch}`)
   const batchRow = await page.$eval('#batch-results tbody tr',
     (e) => e.textContent)
-  rep.ok(batchRow.includes('1UBQ') && batchRow.includes('UBQ'),
+  rep.ok(batchRow.includes('1HRC') && batchRow.includes('HEME'),
     `real batch result row: ${batchRow.slice(0, 60)}`)
   await shot('11-batch')
 

@@ -18,6 +18,7 @@ from dataclasses import dataclass
 import requests
 
 from .config import get_config
+from .net import http_timeout
 
 
 @dataclass
@@ -331,7 +332,7 @@ class DataSourceManager:
             # This is what the current code uses
             response = self._session.get(
                 f"{self.config.rcsb_base_url}/rest/v1/core/entry/{identifier}",
-                timeout=self.config.request_timeout
+                timeout=http_timeout(self.config.request_timeout)
             )
             if response.status_code == 200:
                 # Parse what we can from the entry

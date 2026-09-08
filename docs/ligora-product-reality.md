@@ -1,7 +1,7 @@
 # Ligora — What It Is, What It Does, and Where It Stands
 
 *A grounded, honest product document. Every claim about Ligora's behavior was
-verified against the running code and live tests (77 backend tests + 4 staged
+verified against the running code and live tests (143 backend tests + 6 staged
 UI verification runs on real data). Every external source mentioned was probed
 live (HTTP 200 confirmed) before being written here.*
 
@@ -135,7 +135,51 @@ analysis without writing glue scripts.
 | Exports | Contacts CSV, ligand SDF (CCD-bond-derived), full analysis summary artifact, scene file |
 | Workspace | Per-session workspace directory caching CCD/PubChem artifacts (responsible caching, nothing fabricated) |
 
-### 3.8 Search (BM25 over live documents)
+### 3.8 PDB-wide discovery, protein context, and engine depth (v2.1)
+| Feature | Implementation |
+|---|---|
+| PDB-wide discovery | RCSB Search API (text, MMseqs2 sequence, OpenEye chemical similarity, same-ligand, similar CCD components) — all live |
+| Structure quality | RCSB validation summary (clashscore, RSRZ/Ramachandran outliers) |
+| Protein context | UniProt REST (function, features, real binding-site annotations) |
+| AlphaFold models | AlphaFold DB mmCIF fetch for the entry's SIFTS-mapped accession |
+| Pocket detection | Real `fpocket` binary; descriptors verbatim; honest absence |
+| Secondary structure | Real `mkdssp` (DSSP 4.x); 8-state codes from its own output |
+| 2D interaction diagram | SVG from PLIP's own contacts (RDKit depiction or PCA of real coordinates) |
+| Sequence viewer | Per-chain sequence with contact/DSSP/pocket mapping; click-to-zoom |
+| mmCIF `_struct_conn` export | PLIP's mappable contacts written back in a standards format |
+| Docking box editing | `set_docking_box`/`get_docking_box` + UI overrides |
+| Multi-ligand docking queue | One shared receptor PDBQT, one job per non-solvent ligand |
+| Redocking validation | Crystal-vs-docked Kabsch RMSD (element-aware matching) |
+| Structure superposition | CA superposition via NW alignment + seed-and-extend core fit |
+| Batch interaction aggregation | Per-residue contact frequency across batch results |
+| Keyboard ligand switching | Next/prev shortcuts + recent-ligands list |
+
+### 3.9 v2.2 — affinity evidence, covalent handling, MD, reproducibility
+| Feature | Implementation |
+|---|---|
+| BindingDB affinities | **Current** REST API (`/rest/getLigandsByPDBs`, `/rest/getLigandsByUniprot`), probed live: real Ki/Kd/IC50/EC50 records with PMID/DOI; both real response schemas handled; uncovered entries reported honestly (never an invented empty success) |
+| Covalent-ligand handling | The file's **own** records only — mmCIF `_struct_conn` `covale`/`disulf` rows, or PDB `LINK` records with distances from real atom coordinates (verified on 1HRC: two HEC thioether links at 1.754/1.864 Å, iron coordination correctly excluded as `metalc`); ligand card flags covalent attachment |
+| GROMACS minimization/MD | Real `gmx` wrap: `pdb2gmx → grompp → mdrun → gmx energy` (vacuum EM / short vacuum MD); every parameter user-configured; honest absence; runs as a background job |
+| Reproducibility manifest | `repro_manifest.json`: SHA-256-hashed artifacts, job parameters/results, config snapshot, notes — written into the workspace |
+| Viewer-only file formats | SDF/MOL/MOL2/XYZ/GRO/PDBQT/CDJSON open in the 3D viewer (3Dmol.js native parsing) without pretending chemistry was parsed: no ligand card, no contacts; analysis honestly declines. `.gz`-wrapped structures decompress into the workspace. PDB/mmCIF remain fully parsed |
+| Viewer-only honesty in the backend | `get_status` reports `viewer_only`; contact analysis on a viewer-only session refuses with an explicit reason instead of failing on stale state |
+
+### 3.9a Spec-completion layer (V1/V2 spec items that were missing, now shipped)
+| Feature | Implementation |
+|---|---|
+| Scene image export | The real rendered viewport (viewer canvas pixels) is captured as PNG, validated by the backend (magic bytes, size), stored as the session's `scene.png` artifact, and saved through the native dialog — the "structured analysis artifact = image + data + notes" thesis is complete |
+| Contacts CSV export | One-click button in the Contacts panel driving the existing backend CSV export |
+| Contact table sort/filter | Type filter + sort by type/distance/residue, over the real PLIP rows |
+| Camera presets | Ligand focus / pocket site / interface / whole structure |
+| Pocket surface toggle | Ligand-centric pocket surface over the residues the backend's own geometric binding-pocket computation selected (radius is the config/user setting, never a UI guess) |
+| Top bar | PDB-wide text search (live RCSB Search API, results in the Discover tab), recent-structures list, settings dialog showing live engine + data-source status |
+| Surface representation | Real molecular surface (VDW, translucent) over a thin cartoon backbone |
+| 2D editor → 3D sync | The edited molecule's real geometry + bond graph exported as SDF and overlaid in the 3D viewer as its own model (green carbons); the loaded structure is never modified |
+| Pose clustering + consensus | `compare_results` now clusters the union of two jobs' poses (caller-settable RMSD threshold, no buried constant) and reports a consensus pose (lowest affinity) with real atoms; clustering degrades to empty without ever breaking the core pairwise comparison |
+| RCSB ModelServer | On-demand coordinate subsets (entry/chain/component) as mmCIF from `models.rcsb.org`, parsed by the app's own mmCIF parser and overlaid as a separate model |
+| PDBe REST (EU mirror) | Entry summary, secondary-structure annotation, and ligand monomers from `ebi.ac.uk/pdbe/api` — the §6.1 source is now actually integrated, not just listed |
+
+### 3.10 Search (BM25 over live documents)
 | Feature | Implementation |
 |---|---|
 | Search engine | Real Okapi BM25 (own implementation: TF/IDF/length-norm/k1/b) |
@@ -144,7 +188,7 @@ analysis without writing glue scripts.
 | Queries verified in UI | "myoglobin" → the real 1MBN entry doc; "protoporphyrin" → the HEM chemical doc |
 | Persistent index | Cached under the workspace; refreshes re-fetch live data |
 
-### 3.9 Health & transparency
+### 3.11 Health & transparency
 | Feature | Implementation |
 |---|---|
 | Status view | Live checks of every data source (RCSB, CCD, PubChem, ChEMBL/UniChem) and every engine (PLIP, Open Babel, Vina) — real HTTP/binary checks with a single honest retry on transient timeouts |
@@ -217,56 +261,31 @@ Legend: ✅ real feature · 🟡 partial/indirect · ❌ absent · *(—)* not a
 
 ---
 
-## 5. High-value, closely-related features not yet implemented
-*(All fit the existing architecture; each keeps the no-heuristics contract.)*
+## 5. Roadmap status (updated)
 
-### Tier 1 — small, obviously within the use case
-1. **2D interaction diagram (LigPlot-style schematic)** — render PLIP's own
-   output (already parsed per-contact with atom names/distances) as a 2D
-   residue–ligand schematic (SVG). Zero new chemistry; pure visualization of
-   data already in hand. This is the most-requested missing artifact for
-   publication figures.
-2. **Sequence viewer + interaction mapping** — the parser already builds
-   residues per chain; render the chain sequence and mark contacting residues.
-3. **Per-residue interaction frequency in batch mode** — batch already runs
-   the pipeline over N structures; aggregate contact types per residue across
-   results (pure aggregation of existing outputs).
-4. **Export contacts as mmCIF `_struct_conn` records** — write PLIP's real
-   findings back in a standards format that PyMOL/ChimeraX read natively.
-5. **Keyboard-driven ligand switching** — the ligand select exists; add
-   next/prev shortcuts and a recent-ligands list. Pure UX.
-6. **Search results → open structure/chemical in one click from every hit
-   row** — already implemented for `struct:` docs; extend to chemical docs
-   (open as enrichment card) — small wiring change.
+Everything from the original Tier 1 and Tier 2 roadmap **has shipped and is
+tested** (see §3.8): the 2D interaction diagram, sequence viewer with
+interaction mapping, per-residue batch aggregation, mmCIF `_struct_conn`
+export, keyboard ligand switching + recent ligands, one-click open of both
+structure and chemical search hits, fpocket pockets, DSSP secondary
+structure, docking box editing UI, the multi-ligand docking queue, ligand
+similarity discovery, crystal-vs-docked redocking validation, and structure
+superposition.
 
-### Tier 2 — medium, natural extensions
-7. **Pocket detection via fpocket** — wrap the real `fpocket` binary (same
-   pattern as Vina/Open Babel). Detection of *alternative* pockets beyond the
-   co-crystal ligand is the standard next question after the first analysis;
-   wrapping keeps the no-reimplementation rule.
-8. **Secondary structure via DSSP** — `dssp` is in Ubuntu repos; wrap it to
-   annotate cartoon/contacts with real SS assignment instead of inferred
-   (currently the viewer's cartoon uses 3Dmol's own assignment).
-9. **Docking box editing UI** — box currently derives from the ligand;
-   expose center/size overrides in the docking tab (Vina already accepts
-   them; only UI + payload wiring needed).
-10. **Multi-ligand docking queue** — jobs infrastructure already exists;
-    iterate docking over all non-solvent ligands of a structure.
-11. **Ligand similarity search** — RDKit Morgan/Tanimoto already implemented
-    (`cheminformatics.py`); wire "find similar CCD components" into the
-    ligand card (needs a local CCD index build — real data, one-time fetch).
-12. **Comparison of crystal ligand vs docked poses** — `compare_results`
-    already superposes pose sets; extend to accept the co-crystal ligand as
-    one side (re-docking validation, the standard redocking protocol).
-13. **Structure superposition (protein alignment) for batch pairs** —
-    Kabsch code already exists in comparison; apply to CA atoms of two
-    structures for viewer-aligned comparison.
+Of the original Tier 3:
 
-### Tier 3 — bigger, still on-mission
-14. **MD trajectory snippets** (wrap NAMD/GROMACS remote workflows) — large;
-    only after Tier 1–2.
-15. **Covalent-ligand handling** — needs careful real chemistry (no
-    heuristics); park until the above ships.
+14. **MD trajectory snippets** — the first real step now ships: GROMACS
+    minimization and short vacuum-MD snippets run as background jobs through
+    a real `gmx` wrap (§3.9). Full solvated production MD and trajectory
+    analysis remain future work.
+15. **Covalent-ligand handling** — ships in v2.2, grounded strictly in the
+    file's own covalent-link records (§3.9); richer covalent chemistry
+    (warhead reactivity, covalent docking) remains future work.
+
+What remains genuinely unimplemented:
+- Full solvated production MD with trajectory analysis.
+- Covalent docking / warhead reactivity chemistry.
+- A verified end-to-end snap build (needs a clean core22 host).
 
 ---
 
@@ -275,8 +294,9 @@ Legend: ✅ real feature · 🟡 partial/indirect · ❌ absent · *(—)* not a
 ### 6.1 Verified reachable and immediately integrable
 | Source | What it adds | Endpoint verified | License/terms |
 |---|---|---|---|
-| **RCSB search API** (`search.rcsb.org/rcsbsearch/v2`) | Real structure *discovery*: sequence, ligand-similarity, motif, text queries — replaces/augments the session-scale BM25 index with PDB-wide search | HTTP 200, `total_count: 356` for a UniProt accession query | CC0 (PDB data); API free, attribution requested |
-| **PDBe REST API** (`ebi.ac.uk/pdbe/api/pdb/entry/...`) | EU mirror + annotations RCSB lacks (validation figures, secondary structure, ligand interactions precomputed) | HTTP 200 | CC-BY 4.0 (EBI terms) |
+| **RCSB search API** (`search.rcsb.org/rcsbsearch/v2`) | **Integrated (§3.8)**: text, sequence, chemical-similarity, same-ligand and similar-component discovery, wired into the Discover tab and the top-bar search | HTTP 200 | CC0 (PDB data); API free, attribution requested |
+| **PDBe REST API** (`ebi.ac.uk/pdbe/api/pdb/entry/...`) | **Integrated (§3.9a)**: entry summary, secondary structure, ligand monomers | HTTP 200 (verified live) | CC-BY 4.0 (EBI terms) |
+| **RCSB ModelServer** (`models.rcsb.org/v1`) | **Integrated (§3.9a)**: on-demand mmCIF coordinate subsets (entry/chain/component), parsed by the app's own parser | HTTP 200 (verified live) | CC0 |
 | **RCSB validation data** (`rcsb_vrpt_summary` in entry payload) | Clashscore, RSRZ outliers, Ramachandran outliers — display "structure quality" next to analysis | HTTP 200, field present on 3W85 | CC0 |
 | **UniProt REST** (`rest.uniprot.org/uniprotkb/{acc}.json`) | Protein function, domains, names, PTMs, cross-refs — the protein side of the evidence pane | HTTP 200 (271 KB payload) | CC-BY 4.0 |
 | **AlphaFold DB** (`alphafold.ebi.ac.uk/files/AF-{acc}-F1-model_v6.cif`) | Predicted structures for proteins without experimental structures; overlay confidence (pLDDT is in the file, not a heuristic) | HTTP 200 (**v6** current) | CC-BY 4.0 |
@@ -285,7 +305,7 @@ Legend: ✅ real feature · 🟡 partial/indirect · ❌ absent · *(—)* not a
 ### 6.2 Verified interesting, but integration needs care
 | Source | Status | Note |
 |---|---|---|
-| **BindingDB REST** | HTTP 404 on the probed legacy endpoint — API changed | Real affinity data (Ki/Kd/IC50) for the ligand would complete the evidence pane; requires implementing against their **current** API, not a guessed one. No fallbacks: integrate only when the real endpoint answers. |
+| **BindingDB REST** | **Integrated (v2.2)** against the current REST web services, probed live (`getLigandsByPDBs` returns real Ki records; `getLigandsByUniprot` returns its own `bdb.`-prefixed schema — both handled). Entries outside its coverage are reported honestly, never faked. |
 | **PDBbind** | Already wired as an optional source; requires configured local/remote access per their terms | Affinity values appear in evidence only when the source answers. |
 
 ### 6.3 Engines/tools to wrap (distro packages, same pattern as Vina/PLIP)
@@ -327,8 +347,9 @@ with real data; every failure mode they hit says what is actually wrong.
 - **First-run dependency on network**: identity/enrichment/search are live;
   offline you can view local files but get honest "source unavailable"
   messages instead of cached universes (a deliberate tradeoff).
-- **No publication-grade 2D interaction figure yet** — the data is all there,
-  but today users still reach for LigPlot+ for the final figure (roadmap §5.1).
+- **No publication-grade 2D interaction figure yet** — a 2D diagram from
+  PLIP's own contacts now ships (§3.8); LigPlot+ still offers richer
+  publication styling for the final figure.
 - **Viewer ceiling**: superb at protein–ligand scale; users coming from
   PyMOL with million-atom CryoEM maps will notice the difference.
 - **Undo in the 2D editor** and richer editing affordances are thin.
@@ -344,27 +365,36 @@ with real data; every failure mode they hit says what is actually wrong.
 - x86_64 Linux (snap targets core22/Ubuntu 22.04), ~200 MB install +
   workspace cache.
 - Python 3.10+ with numpy/requests/rdkit (pip), plus distro binaries:
-  `plip`, `openbabel`, `autodock-vina` (all staged in snapcraft.yaml).
+  `plip`, `openbabel`, `autodock-vina`, `gromacs`, `dssp` (all staged in
+  snapcraft.yaml; `fpocket` remains unpackagable — no distro package —
+  and reports honest absence when not user-installed).
 - GUI stack: WebKit/WebView with WebGL (SwiftShader fallback verified in
   headless testing).
 - Network: required for enrichment/search/fetch; docking/contacts/exports
   work fully offline once structures are local.
+
+The three §10 recommendations below were the doc's original "shortest path"
+; the first two have since shipped (RCSB search API discovery, §3.8; 2D
+interaction diagram, §3.8; crystal-vs-docked comparison + box editing UI,
+§3.8/§3.9).
 
 **Operational honesty:**
 - Long operations (PLIP on big structures, Vina at exhaustiveness 16) run as
   real background jobs with progress UI — but contact analysis in the main
   flow is synchronous; a large structure can hold the UI for seconds
   (async-ifying is straightforward with the existing jobs system).
-- The snap was composed coherently (real distro packages staged) but a full
-  snap build was not run in this environment (needs a clean core22 host).
-- The dev/test harness (dev-bridge + CDP stages) is **not** shipped in the
-  product path; the shipped app talks to the same backend through the Rust
-  bridge.
+- The snap stages the real engine packages (`plip`, `openbabel`,
+  `autodock-vina`, `gromacs`, `dssp`) coherently, but a full snap build was
+  not run in this environment (needs a clean core22 host).
+- The dev/test harness (dev-bridge + CDP stages, now 6 stages) is **not**
+  shipped in the product path; the shipped app talks to the same backend
+  through the Rust bridge.
 
 **Reproducibility story:** strong — every artifact export is deterministic
-from real inputs, and the evidence pane doubles as a methods section. A
-"reproduce this analysis" manifest (JSON of inputs/parameters per artifact)
-would formalize it further and is cheap to add.
+from real inputs, and the evidence pane doubles as a methods section. The
+"reproduce this analysis" manifest (§3.9) now formalizes it: SHA-256-hashed
+artifacts plus job parameters/results in one JSON, one click from the
+Structure tab.
 
 ---
 
@@ -386,8 +416,8 @@ would formalize it further and is cheap to add.
 2. **Maturity/breadth** — ChimeraX/VMD do far more *biology*; Ligora is
    scoped to ligand interaction analysis (by design, but say it plainly).
 3. **Community & longevity** — PyMOL/VMD have decades of users, docs, and
-   extensions; Ligora is new with a small test/verification surface (77
-   backend tests + 4 UI stages — good for its age, small in absolute terms).
+   extensions; Ligora is new with a growing test/verification surface (143
+   backend tests + 6 UI stages).
 4. **2D publication figures** — LigPlot+ still owns that deliverable.
 
 **Net position:** Ligora is not "a nicer PyMOL". It is a different category:

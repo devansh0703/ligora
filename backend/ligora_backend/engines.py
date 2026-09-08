@@ -81,9 +81,14 @@ class VinaAdapter:
         output_dir: Path,
         box_center: Optional[List[float]] = None,
         box_size: Optional[List[float]] = None,
+        shared_receptor_pdbqt: Optional[Path] = None,
     ) -> Dict[str, Any]:
         """
         Prepare receptor and ligand PDBQT files with Open Babel.
+
+        When shared_receptor_pdbqt is given and already exists it is
+        reused directly (docking queues over one structure prepare the
+        receptor exactly once); otherwise it is created there first.
 
         Raises RuntimeError with a clear message when preparation is not
         possible (Open Babel missing, ligand chemistry unknown, etc.).
@@ -95,17 +100,22 @@ class VinaAdapter:
                 "preparation but is not installed")
 
         output_dir.mkdir(parents=True, exist_ok=True)
-        receptor_pdb = output_dir / "receptor.pdb"
         ligand_sdf = output_dir / "ligand.sdf"
-        receptor_pdbqt = output_dir / "receptor.pdbqt"
         ligand_pdbqt = output_dir / "ligand.pdbqt"
 
         # Receptor: polymer chains to PDB, then rigid PDBQT conversion.
-        self._write_receptor_pdb(structure, receptor_pdb)
-        self._run_obabel(obabel, [
-            str(receptor_pdb), "-O", str(receptor_pdbqt),
-            "-xr",  # rigid receptor
-        ])
+        # Prepared once per structure and reused across ligands: the
+        # receptor conversion is by far the slowest preparation step.
+        if shared_receptor_pdbqt is not None:
+            receptor_pdbqt = Path(shared_receptor_pdbqt)
+            receptor_pdbqt.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            receptor_pdbqt = output_dir / "receptor.pdbqt"
+        receptor_pdb = receptor_pdbqt.with_suffix(".pdb")
+        if not (receptor_pdbqt.is_file()
+                and receptor_pdbqt.stat().st_size > 0):
+            self._write_receptor_pdb(structure, receptor_pdb)
+            self._prepare_receptor_pdbqt(receptor_pdb, receptor_pdbqt)
 
         # Ligand: 3D SDF via RDKit bond perception (real chemistry).
         from .cheminformatics import Cheminformatics
@@ -132,6 +142,19 @@ class VinaAdapter:
             "box_center": box_center,
             "box_size": box_size,
         }
+
+    def _prepare_receptor_pdbqt(self, receptor_pdb: Path,
+                                receptor_pdbqt: Path):
+        """Rigid receptor PDBQT conversion via Open Babel."""
+        obabel = self._obabel_path()
+        if not obabel:
+            raise RuntimeError(
+                "Open Babel (obabel) is required for docking input "
+                "preparation but is not installed")
+        self._run_obabel(obabel, [
+            str(receptor_pdb), "-O", str(receptor_pdbqt),
+            "-xr",  # rigid receptor
+        ])
 
     def _run_obabel(self, obabel: str, args: List[str]):
         result = subprocess.run(
@@ -173,6 +196,20 @@ class VinaAdapter:
                     serial += 1
         lines.append("END")
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def prepare_receptor(self, structure: Structure, receptor_pdbqt: Path):
+        """
+        Prepare the rigid receptor PDBQT once for reuse across many
+        ligand dockings (docking queue). Idempotent: skips conversion
+        when the file already exists with content.
+        """
+        receptor_pdbqt = Path(receptor_pdbqt)
+        if receptor_pdbqt.is_file() and receptor_pdbqt.stat().st_size > 0:
+            return
+        receptor_pdbqt.parent.mkdir(parents=True, exist_ok=True)
+        receptor_pdb = receptor_pdbqt.with_suffix(".pdb")
+        self._write_receptor_pdb(structure, receptor_pdb)
+        self._prepare_receptor_pdbqt(receptor_pdb, receptor_pdbqt)
 
     def compute_box(self, ligand: Ligand) -> tuple:
         """

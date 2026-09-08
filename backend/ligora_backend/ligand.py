@@ -15,7 +15,9 @@ caller surfaces the gap to the user.
 """
 
 import hashlib
+import json
 import time
+from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
 from urllib.parse import quote
 
@@ -26,6 +28,10 @@ from .schemas import (
     LigandResolutionStatus,
 )
 from .config import get_config
+from .net import http_timeout
+
+# Sentinel distinguishing "no disk entry" from a cached miss (None value).
+_DISK_MISS = object()
 
 # Descriptor type constants from the RCSB chem_comp endpoint payloads.
 _DESC_SMILES = "SMILES"
@@ -48,7 +54,7 @@ def ccd_element_map(comp_id: str) -> Dict[str, Optional[str]]:
     comp_id = comp_id.upper()
     url = f"{config.rcsb_files_url}/ligands/view/{quote(comp_id)}.cif"
     try:
-        response = requests.get(url, timeout=config.request_timeout)
+        response = requests.get(url, timeout=http_timeout(config.request_timeout))
         if response.status_code != 200:
             return {}
         content = response.text
@@ -80,7 +86,7 @@ def ccd_ideal_coordinates(comp_id: str) -> Dict[str, Tuple[str, float, float, fl
     comp_id = comp_id.upper()
     url = f"{config.rcsb_files_url}/ligands/view/{quote(comp_id)}.cif"
     try:
-        response = requests.get(url, timeout=config.request_timeout)
+        response = requests.get(url, timeout=http_timeout(config.request_timeout))
         if response.status_code != 200:
             return {}
         content = response.text
@@ -162,7 +168,7 @@ def _fetch_ccd_cif_category(comp_id: str,
     config = get_config()
     url = f"{config.rcsb_files_url}/ligands/view/{quote(comp_id.upper())}.cif"
     try:
-        response = requests.get(url, timeout=config.request_timeout)
+        response = requests.get(url, timeout=http_timeout(config.request_timeout))
         if response.status_code != 200:
             return None
         content = response.text
@@ -179,7 +185,7 @@ def _fetch_ccd_raw(comp_id: str) -> Optional[Dict[str, Any]]:
     config = get_config()
     url = f"{config.rcsb_data_url}/core/chemcomp/{quote(comp_id.upper())}"
     try:
-        response = requests.get(url, timeout=config.request_timeout)
+        response = requests.get(url, timeout=http_timeout(config.request_timeout))
         if response.status_code != 200:
             return None
         return response.json()
@@ -200,6 +206,48 @@ class LigandResolver:
     # Cache helpers
     # ------------------------------------------------------------------
 
+    def _disk_cache_path(self, key: str) -> Optional[Path]:
+        """Workspace-backed cache file for a lookup key (None if unusable)."""
+        try:
+            config = get_config()
+            safe = hashlib.md5(key.encode()).hexdigest()
+            return config.cache_dir / "resolver" / f"{safe}.json"
+        except (OSError, ValueError):
+            return None
+
+    def _disk_read(self, key: str) -> Optional[Any]:
+        """Read a cached lookup result; None when absent or expired."""
+        path = self._disk_cache_path(key)
+        if path is None or not path.exists():
+            return _DISK_MISS
+        try:
+            doc = json.loads(path.read_text())
+            if time.time() > doc.get("expires", 0):
+                return _DISK_MISS
+            return doc.get("value", _DISK_MISS)
+        except (OSError, ValueError):
+            return _DISK_MISS
+
+    def _disk_write(self, key: str, value: Any) -> None:
+        """Persist a lookup result with its TTL (responsible caching)."""
+        path = self._disk_cache_path(key)
+        if path is None:
+            return
+        try:
+            config = get_config()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            # A missed source is retried after a shorter interval; a real
+            # answer is kept for the configured TTL.
+            ttl = (config.cache_ttl_seconds if value is not None
+                   else min(3600, config.cache_ttl_seconds))
+            path.write_text(json.dumps({
+                "key": key,
+                "value": value,
+                "expires": time.time() + ttl,
+            }))
+        except (OSError, ValueError, TypeError):
+            pass  # cache write failures never break resolution
+
     def _is_cache_valid(self, key: str) -> bool:
         if key not in self._cache_expiry:
             return False
@@ -211,11 +259,21 @@ class LigandResolver:
         self._cache_expiry[key] = time.time() + config.cache_ttl_seconds
 
     def _cached(self, key: str, fetch):
-        """Cache-through helper: return cached value or fetch and cache."""
+        """Cache-through helper: in-memory, then workspace disk, then live.
+
+        All layers hold real fetched data with the same TTL; nothing is
+        fabricated. A source that did not answer is remembered for a short
+        interval only, so unavailability is retried later.
+        """
         if self._is_cache_valid(key):
             return self._cache.get(key)
+        disk = self._disk_read(key)
+        if disk is not _DISK_MISS:
+            self._set_cache(key, disk)
+            return disk
         value = fetch()
         self._set_cache(key, value)
+        self._disk_write(key, value)
         return value
 
     def clear_cache(self):
@@ -303,7 +361,8 @@ class LigandResolver:
         url = (f"{config.pubchem_base_url}/compound/name/"
                f"{quote(name)}/cids/JSON")
         try:
-            resp = requests.get(url, timeout=config.request_timeout)
+            resp = requests.get(
+                        url, timeout=http_timeout(config.request_timeout))
             if resp.status_code != 200:
                 return None
             cids = resp.json().get("IdentifierList", {}).get("CID", [])
@@ -319,7 +378,8 @@ class LigandResolver:
         url = (f"{config.pubchem_base_url}/compound/fastformula/"
                f"{quote(formula)}/cids/JSON")
         try:
-            resp = requests.get(url, timeout=config.request_timeout)
+            resp = requests.get(
+                        url, timeout=http_timeout(config.request_timeout))
             if resp.status_code != 200:
                 return None
             cids = resp.json().get("IdentifierList", {}).get("CID", [])
@@ -333,7 +393,8 @@ class LigandResolver:
         url = (f"{config.pubchem_base_url}/compound/cid/{cid}/property/"
                f"MolecularWeight,CanonicalSMILES,InChIKey,IUPACName,Title/JSON")
         try:
-            resp = requests.get(url, timeout=config.request_timeout)
+            resp = requests.get(
+                        url, timeout=http_timeout(config.request_timeout))
             if resp.status_code != 200:
                 return None
             props_list = resp.json().get("PropertyTable", {}).get(
@@ -370,7 +431,8 @@ class LigandResolver:
             if inchi_key:
                 url = f"{config.unichem_base_url}/inchikey/{inchi_key}"
                 try:
-                    resp = requests.get(url, timeout=config.request_timeout)
+                    resp = requests.get(
+                        url, timeout=http_timeout(config.request_timeout))
                     if resp.status_code == 200:
                         mappings = resp.json()
                         if isinstance(mappings, list):
@@ -390,7 +452,8 @@ class LigandResolver:
                 url = (f"{config.chembl_base_url}/similarity/"
                        f"{quote(smiles)}/70.json?limit=1")
                 try:
-                    resp = requests.get(url, timeout=config.request_timeout)
+                    resp = requests.get(
+                        url, timeout=http_timeout(config.request_timeout))
                     if resp.status_code == 200:
                         molecules = resp.json().get("molecules", [])
                         if molecules:
@@ -420,7 +483,7 @@ class LigandResolver:
             return None
         url = f"{config.pdbbind_url.rstrip('/')}/compounds/{pdb_id}"
         try:
-            response = requests.get(url, timeout=config.request_timeout)
+            response = requests.get(url, timeout=http_timeout(config.request_timeout))
             if response.status_code == 200:
                 data = response.json()
                 affinity = (data.get("affinity_value") or data.get("Kd")
@@ -446,11 +509,19 @@ class LigandResolver:
         Progressively enriches from CCD, PubChem, ChEMBL, and (when a source
         answers) PDBBind. Every attached value carries its origin in the
         evidence chain.
+
+        CCD-first short-circuit: when the CCD itself classifies the component
+        as solvent (HETAS) or an ion (HETAI), that classification IS the
+        authoritative identity for our purposes, and the drug-database chain
+        (PubChem/ChEMBL/UniChem) is not consulted. This is not a heuristic —
+        it is the CCD's own classification deciding which sources are
+        relevant; no value is ever invented.
         """
         evidence: List[Dict[str, Any]] = []
 
         # 1) CCD - source of record for PDB chemical components.
         ccd = self._lookup_ccd(ligand.residue_name)
+        ccd_pdbx_type = (ccd or {}).get("pdbx_type")
         if ccd:
             if ccd.get("formula"):
                 ligand.formula = ccd["formula"]
@@ -475,6 +546,13 @@ class LigandResolver:
                 "url": (f"{get_config().rcsb_data_url}/core/chemcomp/"
                         f"{ligand.residue_name.upper()}"),
             })
+
+        if ccd_pdbx_type in ("HETAS", "HETAI"):
+            # Solvent/ion identity is complete from the CCD alone.
+            ligand.resolution_status = LigandResolutionStatus.PARTIAL
+            ligand.has_2d_structure = bool(ligand.smiles)
+            self._last_evidence = evidence
+            return ligand
 
         # 2) PubChem - compound identity and properties.
         pubchem = self._lookup_pubchem(

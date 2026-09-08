@@ -48,6 +48,11 @@ class Config:
         # endpoint it is queried; otherwise affinity lookups report
         # "not available" instead of synthesizing values.
         self.pdbbind_url: Optional[str] = os.environ.get("LIGORA_PDBBIND_URL")
+        # BindingDB REST web services (real affinity records, Ki/Kd/IC50).
+        self.bindingdb_base_url: str = os.environ.get(
+            "LIGORA_BINDINGDB_URL",
+            "https://bindingdb.org",
+        )
 
         # API settings
         self.request_timeout: int = int(os.environ.get(
@@ -69,6 +74,20 @@ class Config:
         # Tool timeouts
         self.plip_timeout: int = int(os.environ.get("LIGORA_PLIP_TIMEOUT", "300"))
         self.vina_timeout: int = int(os.environ.get("LIGORA_VINA_TIMEOUT", "3600"))
+
+        # MD engine (GROMACS; user-provided, never simulated)
+        self.gromacs_executable: Optional[str] = os.environ.get(
+            "LIGORA_GMX_PATH")
+        self.md_timeout: int = int(os.environ.get(
+            "LIGORA_MD_TIMEOUT", "7200"))
+        # Default force field for pdb2gmx when the user does not choose one.
+        # None means GROMACS selects from its own shipped force-field list
+        # (its engine-owned default); the chosen field is recorded in the
+        # result. A configuration value, not chemistry knowledge.
+        self.md_force_field: Optional[str] = os.environ.get(
+            "LIGORA_MD_FORCEFIELD")
+        self.md_water_model: str = os.environ.get(
+            "LIGORA_MD_WATER", "none")
 
         # Docking settings
         self.default_docking_exhaustiveness: int = int(os.environ.get(

@@ -29,9 +29,9 @@ def real_complex():
         "https://files.rcsb.org/download/3W85.cif", timeout=60).text
     structure = StructureParser().parse_mmcif(
         content, source_id="3W85", source="rcsb")
-    ligand = next(l for l in structure.ligands
-                  if l.residue_name == "W85" and l.atoms
-                  and l.atoms[0].chain_id == "A")
+    ligand = next(lig for lig in structure.ligands
+                  if lig.residue_name == "W85" and lig.atoms
+                  and lig.atoms[0].chain_id == "A")
     # Element completion comes from the CCD (parser helper) - required for
     # a real ligand 3D SDF during docking preparation.
     StructureParser().complete_missing_elements(structure)

@@ -163,7 +163,8 @@ class ArtifactExporter:
 
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        self.save_analysis_summary(session_id, summary, output_dir / 'analysis_summary.json')
+        path = output_dir / 'analysis_summary.json'
+        self.save_analysis_summary(session_id, summary, path)
 
         return output_dir
 
@@ -174,7 +175,8 @@ class ArtifactExporter:
         lines.append('=' * 80)
         lines.append('')
         lines.append(f'Structure: {summary.structure_id}')
-        lines.append(f'Ligand: {summary.ligand_name} ({summary.ligand_formula or "N/A"})')
+        formula = summary.ligand_formula or "N/A"
+        lines.append(f'Ligand: {summary.ligand_name} ({formula})')
         lines.append(f'Contacts: {summary.contact_count}')
         lines.append(f'Status: {summary.resolution_status}')
         if summary.notes:

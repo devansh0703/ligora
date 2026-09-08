@@ -24,26 +24,24 @@ def fetch(pdb_id: str):
 
 
 def resolve_representatives(structure):
-    """Run the app's real resolution pipeline once per unique component.
+    """Run the app's real resolution pipeline over every ligand instance.
 
-    The parser deliberately leaves classification as None (it comes from the
-    live CCD via LigandResolver, never invented in the parser), so tests that
-    assert on classification must drive the same pipeline the app uses.
+    Mirrors the app's loader (server._load_and_resolve): every ligand
+    instance is resolved against the live CCD. Per-component caching inside
+    the resolver keeps repeated instances cheap. The parser deliberately
+    leaves classification as None (it comes from the live CCD, never
+    invented in the parser).
     """
     resolver = LigandResolver()
-    resolved = {}
     for lig in structure.ligands:
-        if lig.residue_name in resolved:
-            continue
-        resolved[lig.residue_name] = resolver.resolve_ligand(lig)
-    return resolved
+        resolver.resolve_ligand(lig)
 
 
 def drug_like_ligands(structure):
     """Ligands whose CCD classification is neither solvent nor ion."""
-    return [l for l in structure.ligands
-            if l.classification_hint not in ("HETAS", "HETAI")
-            and l.classification_hint]
+    return [lig for lig in structure.ligands
+            if lig.classification_hint not in ("HETAS", "HETAI")
+            and lig.classification_hint]
 
 
 def test_1crn_protein_only_no_false_positive_ligand():
@@ -62,14 +60,14 @@ def test_1ubq_water_never_the_ligand():
     """1UBQ: protein + waters only; water must not be selected as ligand."""
     s = fetch("1UBQ")
     resolve_representatives(s)
-    candidates = [l for l in s.ligands
-                  if l.classification_hint not in ("HETAS", "HETAI")]
+    candidates = [lig for lig in s.ligands
+                  if lig.classification_hint not in ("HETAS", "HETAI")]
     assert candidates == [], (
-        f"false positive: {[(l.residue_name, l.classification_hint) for l in candidates]}")
+        f"false positive: {[(lig.residue_name, lig.classification_hint) for lig in candidates]}")
     # Waters themselves are classified as solvent by the CCD.
-    waters = [l for l in s.ligands if l.classification_hint == "HETAS"]
+    waters = [lig for lig in s.ligands if lig.classification_hint == "HETAS"]
     assert waters, "CCD must classify HOH as HETAS solvent"
-    assert all(l.residue_name == "HOH" for l in waters)
+    assert all(lig.residue_name == "HOH" for lig in waters)
 
 
 def test_1fnb_fad_cofactor_is_found():
@@ -78,9 +76,9 @@ def test_1fnb_fad_cofactor_is_found():
     carries no FAD; 1FNB verified live to contain FAD entity 4.)"""
     s = fetch("1FNB")
     resolve_representatives(s)
-    names = {l.residue_name for l in drug_like_ligands(s)}
+    names = {lig.residue_name for lig in drug_like_ligands(s)}
     assert "FAD" in names, f"FAD cofactor missed; got {names}"
-    fad = next(l for l in s.ligands if l.residue_name == "FAD")
+    fad = next(lig for lig in s.ligands if lig.residue_name == "FAD")
     assert fad.classification_hint not in ("HETAS", "HETAI")
 
 
@@ -104,13 +102,13 @@ def test_1ehz_trna_rna_system_parses():
     assert s.chains, "chains must parse for an all-RNA entry"
     resolve_representatives(s)
     # Waters must be present and classified as solvent (huge solvent arena).
-    waters = [l for l in s.ligands if l.residue_name == "HOH"]
+    waters = [lig for lig in s.ligands if lig.residue_name == "HOH"]
     assert waters, "1EHZ must contain waters"
     assert waters[0].classification_hint == "HETAS"
     # Spermine (SPM) is a real polyamine ligand, not solvent.
-    names = {l.residue_name for l in s.ligands}
+    names = {lig.residue_name for lig in s.ligands}
     if "SPM" in names:
-        spm = next(l for l in s.ligands if l.residue_name == "SPM")
+        spm = next(lig for lig in s.ligands if lig.residue_name == "SPM")
         assert spm.classification_hint not in ("HETAS", "HETAI")
 
 
@@ -125,9 +123,9 @@ def test_1mbn_heme_found_not_water():
     """1MBN: myoglobin with heme (HEM) + sulfate; heme must not be water."""
     s = fetch("1MBN")
     resolve_representatives(s)
-    names = {l.residue_name for l in drug_like_ligands(s)}
+    names = {lig.residue_name for lig in drug_like_ligands(s)}
     assert "HEM" in names, f"heme missed; ligands: {sorted(names)[:10]}"
-    hem = next(l for l in s.ligands if l.residue_name == "HEM")
+    hem = next(lig for lig in s.ligands if lig.residue_name == "HEM")
     assert hem.classification_hint not in ("HETAS", "HETAI")
 
 
@@ -162,7 +160,7 @@ def test_ligand_resolution_real_cids_across_types():
     }
     for pdb_id, (comp, expected_cid) in cases.items():
         s = fetch(pdb_id)
-        lig = next(l for l in s.ligands if l.residue_name == comp)
+        lig = next(lig for lig in s.ligands if lig.residue_name == comp)
         resolved = LigandResolver().resolve_ligand(lig, pdb_id)
         assert resolved.pubchem_cid == expected_cid, (
             f"{comp}: got {resolved.pubchem_cid}, expected {expected_cid}")

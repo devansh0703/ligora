@@ -815,3 +815,57 @@ body {
   border-color: var(--danger);
   color: var(--danger);
 }
+
+/* ---- v2.1: sequence viewer, diagram, panels ----------------------- */
+
+.seq-row {
+  display: flex;
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  margin-bottom: 2px;
+}
+
+.seq-cell {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  font-size: 9px;
+  line-height: 16px;
+  text-align: center;
+  color: var(--text-primary);
+  border-right: 1px solid rgba(255, 255, 255, 0.04);
+}
+
+.seq-aa-cell {
+  cursor: default;
+  background: var(--bg-elevated);
+}
+
+.seq-aa-cell.seq-contact {
+  background: var(--danger);
+  color: #fff;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.seq-aa-cell.seq-pocket {
+  outline: 1px solid #a371f7;
+}
+
+.diagram-wrap {
+  background: #fff;
+  border-radius: var(--radius-md);
+  padding: 8px;
+  overflow: auto;
+  max-height: 420px;
+}
+
+.diagram-wrap svg {
+  max-width: 100%;
+  height: auto;
+}
+
+#v2-dock {
+  max-height: 45vh;
+  overflow-y: auto;
+}

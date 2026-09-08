@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional
 import requests
 
 from .config import get_config
+from .net import http_timeout
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 
@@ -135,7 +136,8 @@ class SearchIndex:
         # rcsb_data_url already ends with /rest/v1.
         url = f"{self.config.rcsb_data_url}/core/entry/{pdb_id}"
         try:
-            resp = self._session.get(url, timeout=self.config.request_timeout)
+            resp = self._session.get(
+                url, timeout=http_timeout(self.config.request_timeout))
             if resp.status_code != 200:
                 return None
             entry = resp.json()
@@ -164,7 +166,8 @@ class SearchIndex:
         # rcsb_data_url already ends with /rest/v1.
         url = f"{self.config.rcsb_data_url}/core/chemcomp/{comp_id}"
         try:
-            resp = self._session.get(url, timeout=self.config.request_timeout)
+            resp = self._session.get(
+                url, timeout=http_timeout(self.config.request_timeout))
             if resp.status_code != 200:
                 return None
             payload = resp.json()
@@ -197,7 +200,8 @@ class SearchIndex:
         url = (f"{self.config.pubchem_base_url}/compound/cid/{cid}/"
                f"property/{props}/JSON")
         try:
-            resp = self._session.get(url, timeout=self.config.request_timeout)
+            resp = self._session.get(
+                url, timeout=http_timeout(self.config.request_timeout))
             if resp.status_code != 200:
                 return None
             prop = (resp.json().get("PropertyTable", {})

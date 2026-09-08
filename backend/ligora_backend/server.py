@@ -42,6 +42,19 @@ from .enrichment import EnrichmentClient
 from .engines import EngineRegistry, VinaAdapter
 from .search import SearchIndex
 from .jobs import JobManager
+from .v2.pockets import PocketDetector
+from .v2.ssdssp import DSSPAnalyzer
+from .v2.discovery import DiscoveryClient, DiscoveryError
+from .v2.bindingdb import BindingDBClient, BindingDBError
+from .v2.md import MDAdapter
+from .v2.covale import detect_covalent_links, covalent_flag_for_ligand
+from .v2.manifest import write_repro_manifest
+from .v2.diagram2d import build_interaction_diagram
+from .v2.aggregation import (
+    aggregate_interaction_frequencies,
+    export_frequency_csv,
+    export_struct_conn,
+)
 from .export import ArtifactExporter
 from .v2.water import WaterNetworkAnalyzer
 from .v2.editors import Ligand2DEditor
@@ -50,6 +63,15 @@ from .v2.comparison import ResultComparator
 from .v2.scripting import ScriptingConsole
 
 import numpy as np
+from .net import http_timeout
+
+# Standard three-letter to one-letter amino acid codes (IUPAC convention).
+_THREE_TO_ONE = {
+    "ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C",
+    "GLN": "Q", "GLU": "E", "GLY": "G", "HIS": "H", "ILE": "I",
+    "LEU": "L", "LYS": "K", "MET": "M", "PHE": "F", "PRO": "P",
+    "SER": "S", "THR": "T", "TRP": "W", "TYR": "Y", "VAL": "V",
+}
 
 
 class BackendServer:
@@ -86,6 +108,20 @@ class BackendServer:
         # 2D editors per session
         self._editors: Dict[str, Ligand2DEditor] = {}
 
+        # Engines and clients for v2.1 features (real external tools)
+        self.pocket_detector = PocketDetector()
+        self.dssp_analyzer = DSSPAnalyzer()
+        self.discovery_client = DiscoveryClient()
+        self.bindingdb_client = BindingDBClient()
+        self.md_adapter = MDAdapter()
+        # Last contact analysis per session, for downstream features
+        # (diagram, struct_conn export) that consume PLIP's real output.
+        self._last_contacts: Dict[str, List] = {}
+        self._last_contacts_ligand: Dict[str, str] = {}
+        # Last engine results per session (sequence-view annotations).
+        self._session_dssp: Dict[str, Dict[str, Any]] = {}
+        self._session_pockets: Dict[str, Dict[str, Any]] = {}
+
         self._handlers: Dict[str, Callable] = {
             'open_local_file': self._handle_open_local_file,
             'open_pdb_id': self._handle_open_pdb_id,
@@ -103,6 +139,7 @@ class BackendServer:
             'get_status': self._handle_get_status,
             'export_ligand_sdf': self._handle_export_ligand_sdf,
             'export_contacts_csv': self._handle_export_contacts_csv,
+            'save_scene_image': self._handle_save_scene_image,
             'get_structure_file': self._handle_get_structure_file,
             'set_notes': self._handle_set_notes,
             # v2 features
@@ -114,6 +151,7 @@ class BackendServer:
             'editor_remove_bond': self._handle_editor_remove_bond,
             'editor_update_position': self._handle_editor_update_position,
             'editor_export_sdf': self._handle_editor_export_sdf,
+            'editor_sync_to_3d': self._handle_editor_sync_to_3d,
             'batch_add': self._handle_batch_add,
             'batch_run': self._handle_batch_run,
             'batch_export': self._handle_batch_export,
@@ -122,6 +160,38 @@ class BackendServer:
             'compare_results': self._handle_compare_results,
             'search': self._handle_search,
             'search_index_refresh': self._handle_search_index_refresh,
+            # v2.1: discovery, pockets, dssp, diagram, aggregation
+            'discover_text': self._handle_discover_text,
+            'discover_sequence': self._handle_discover_sequence,
+            'discover_chemical': self._handle_discover_chemical,
+            'discover_similar_components':
+                self._handle_discover_similar_components,
+            'enrich_component': self._handle_enrich_component,
+            'discover_same_ligand': self._handle_discover_same_ligand,
+            'entry_quality': self._handle_entry_quality,
+            'uniprot_context': self._handle_uniprot_context,
+            'alphafold_model': self._handle_alphafold_model,
+            'modelserver_subset': self._handle_modelserver_subset,
+            'pdbe_entry_summary': self._handle_pdbe_entry_summary,
+            'pdbe_secondary_structure': self._handle_pdbe_secondary_structure,
+            'pdbe_ligand_monomers': self._handle_pdbe_ligand_monomers,
+            'detect_pockets': self._handle_detect_pockets,
+            'run_dssp': self._handle_run_dssp,
+            'get_interaction_diagram': self._handle_get_interaction_diagram,
+            'aggregate_batch_interactions':
+                self._handle_aggregate_batch_interactions,
+            'export_struct_conn': self._handle_export_struct_conn,
+            'compare_crystal_docked': self._handle_compare_crystal_docked,
+            'superpose_structures': self._handle_superpose_structures,
+            'get_sequence_view': self._handle_get_sequence_view,
+            'get_docking_box': self._handle_get_docking_box,
+            'queue_docking': self._handle_queue_docking,
+            # v2.2: BindingDB affinities, covalent links, GROMACS MD,
+            # reproducibility manifest
+            'bindingdb_affinity': self._handle_bindingdb_affinity,
+            'get_covalent_links': self._handle_get_covalent_links,
+            'run_md': self._handle_run_md,
+            'export_repro_manifest': self._handle_export_repro_manifest,
         }
 
         self._running = False
@@ -283,12 +353,51 @@ class BackendServer:
 
         target = self.workspace_manager.copy_structure_to_workspace(
             session, path, path.name)
+
+        # Gzip-wrapped structures (cif.gz / pdb.gz) are decompressed into
+        # the workspace and treated as their inner format.
+        if path.name.lower().endswith('.gz'):
+            import gzip
+            try:
+                with gzip.open(target, 'rt', encoding='utf-8',
+                               errors='replace') as fh:
+                    inner_content = fh.read()
+            except (OSError, EOFError) as e:
+                raise ValueError(f"Cannot read gzip structure {path.name}: {e}")
+            inner_name = path.name[:-3]  # strip .gz
+            target = session.get_workspace() / inner_name
+            target.write_text(inner_content, encoding='utf-8')
+            path = target  # the inner format drives id/format detection
+
+        # Formats the 3D viewer (3Dmol.js) renders natively but the app's
+        # own parser does not turn into chains/ligands: they open view-only.
+        # The chemistry is never guessed — analysis features report that no
+        # parsed structure exists instead of approximating one.
+        fmt = target.suffix.lower().lstrip('.')
+        viewer_only_formats = {
+            'mol2', 'sdf', 'mol', 'xyz', 'gro', 'pdbqt', 'cdjson',
+        }
+        if fmt in viewer_only_formats:
+            structure = Structure(
+                id=path.stem, source='local', file_path=str(target),
+                file_format=fmt, viewer_only=True)
+            structure.title = path.name
+            session.structure = structure
+            session.file_path = str(target)
+            return {
+                'structure': self._structure_to_dict(structure),
+                'viewer_only': True,
+                'session_id': session.id,
+                'workspace_path': str(session.get_workspace()),
+            }
+
         content = path.read_text(encoding='utf-8', errors='replace')
         structure = self._load_and_resolve(
             session, content, path.stem, 'local', target)
 
         return {
             'structure': self._structure_to_dict(structure),
+            'viewer_only': False,
             'session_id': session.id,
             'workspace_path': str(session.get_workspace()),
         }
@@ -311,7 +420,9 @@ class BackendServer:
         import requests
         url = f"{self.config.rcsb_files_url}/download/{pdb_id}.cif"
         try:
-            response = requests.get(url, timeout=self.config.request_timeout)
+            response = requests.get(
+                url,
+                timeout=http_timeout(self.config.request_timeout))
             response.raise_for_status()
             content = response.text
         except requests.RequestException as e:
@@ -373,6 +484,11 @@ class BackendServer:
         session_id: str,
     ) -> Dict[str, Any]:
         session = self._require_structure(session_id)
+        if getattr(session.structure, 'viewer_only', False):
+            raise ValueError(
+                "This file is view-only (its format is rendered by the "
+                "viewer but never parsed into chains/ligands); contact "
+                "analysis needs a PDB or mmCIF structure")
         if not session.selected_ligand_id:
             raise ValueError("No ligand selected")
 
@@ -411,6 +527,10 @@ class BackendServer:
 
         self.contact_analyzer.export_contacts_csv(
             contacts, session.get_contacts_path())
+        # Keep the real PLIP contacts for downstream consumers (diagram,
+        # struct_conn export) — same objects the caller receives.
+        self._last_contacts[session.id] = list(contacts)
+        self._last_contacts_ligand[session.id] = ligand.id
 
         return {
             'contacts': [self._contact_to_dict(c) for c in contacts],
@@ -858,6 +978,37 @@ class BackendServer:
                 "No contacts exported yet; run contact analysis first")
         return {'path': str(contacts_path), 'format': 'csv'}
 
+    def _handle_save_scene_image(
+        self,
+        payload: Dict[str, Any],
+        session_id: str,
+    ) -> Dict[str, Any]:
+        """
+        Store a scene image (PNG bytes, base64-encoded from the viewer's
+        canvas) as the session's scene artifact. The pixels are the real
+        rendered viewport — the backend never re-renders or approximates.
+        """
+        import base64
+        session = self._require_session(session_id)
+        if not session.structure:
+            raise ValueError("No structure loaded in session")
+        data_b64 = payload.get('png_base64')
+        if not data_b64:
+            raise ValueError("png_base64 is required (viewer canvas capture)")
+        try:
+            raw = base64.b64decode(data_b64, validate=True)
+        except (ValueError, TypeError) as e:
+            raise ValueError(f"png_base64 is not valid base64: {e}")
+        if len(raw) < 100 or not raw.startswith(b'\x89PNG'):
+            raise ValueError("Payload is not a PNG image")
+        out_path = session.get_scene_image_path()
+        out_path.write_bytes(raw)
+        return {
+            'path': str(out_path),
+            'size_bytes': len(raw),
+            'format': 'png',
+        }
+
     # ------------------------------------------------------------------
     # Structure file access (for the 3D viewer)
     # ------------------------------------------------------------------
@@ -867,22 +1018,32 @@ class BackendServer:
         payload: Dict[str, Any],
         session_id: str,
     ) -> Dict[str, Any]:
-        """Return the loaded structure file content for the viewer."""
+        """
+        Return the loaded structure file content for the viewer, tagged
+        with the format name 3Dmol.js parses it as.
+        """
         session = self._require_structure(session_id)
+        # 3Dmol.js format names for every file type the app accepts.
+        threedmol_formats = {
+            '.pdb': 'pdb', '.ent': 'pdb',
+            '.cif': 'cif', '.mcif': 'cif', '.cif.gz': 'cif',
+            '.mol2': 'mol2', '.sdf': 'sdf', '.mol': 'sdf',
+            '.xyz': 'xyz', '.gro': 'gro', '.pdbqt': 'pdbqt',
+        }
         path = session.get_workspace() / f"{session.structure.id}.cif"
         if not path.exists():
             # Local files are copied under their original name.
             for candidate in session.get_workspace().glob('*'):
-                if candidate.suffix.lower() in ('.cif', '.mcif', '.pdb',
-                                                '.ent'):
+                if candidate.suffix.lower() in threedmol_formats:
                     path = candidate
                     break
         if not path.exists():
             raise FileNotFoundError(
                 "Structure file not found in workspace")
+        fmt = threedmol_formats.get(
+            path.suffix.lower(),
+            'pdb' if path.suffix.lower() in ('.pdb', '.ent') else 'cif')
         content = path.read_text(encoding='utf-8', errors='replace')
-        fmt = ('pdb' if path.suffix.lower() in ('.pdb', '.ent')
-               else 'cif')
         return {
             'path': str(path),
             'format': fmt,
@@ -906,6 +1067,797 @@ class BackendServer:
     # Status
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # v2.1: docking box readout + multi-ligand docking queue
+    # ------------------------------------------------------------------
+
+    def _handle_get_docking_box(
+            self, payload, session_id) -> Dict[str, Any]:
+        """
+        The docking box that would be used right now: the user-set one
+        when present, else the co-crystallized-ligand box from Vina's own
+        compute_box. Returned so the UI can display/edit it before a run.
+        """
+        session = self._require_structure(session_id)
+        vina: VinaAdapter = self.engine_registry.get_adapter(EngineType.VINA)
+        if session.docking_box and session.docking_box.get('center'):
+            box = {
+                'center': [round(float(c), 3)
+                           for c in session.docking_box['center']],
+                'size': [round(float(s), 3)
+                         for s in session.docking_box['size']],
+                'source': 'user_set',
+            }
+        else:
+            if not session.selected_ligand_id:
+                raise ValueError("No ligand selected: cannot derive a box")
+            ligand = self._find_ligand(session, session.selected_ligand_id)
+            if not ligand or not ligand.atoms:
+                raise ValueError(
+                    "Selected ligand has no atoms; cannot derive a box")
+            center, size = vina.compute_box(ligand)
+            box = {'center': center, 'size': size, 'source': 'ligand_extent'}
+        return {'box': box}
+
+    def _handle_queue_docking(
+            self, payload, session_id) -> Dict[str, Any]:
+        """
+        Dock every non-solvent, non-ion ligand of the structure (or an
+        explicit list of ligand_ids), one real Vina job each. Jobs run
+        through the real JobManager; each appears in the jobs panel.
+        """
+        session = self._require_structure(session_id)
+        vina: VinaAdapter = self.engine_registry.get_adapter(EngineType.VINA)
+        if not vina.is_available():
+            raise RuntimeError(
+                "AutoDock Vina is not installed - docking results are "
+                "never simulated")
+        if not vina.preparation_available():
+            raise RuntimeError(
+                "Open Babel is not available; PDBQT preparation cannot run")
+
+        requested = payload.get('ligand_ids') or []
+        candidates = []
+        for lig in session.structure.ligands:
+            if lig.classification_hint in ('HETAS', 'HETAI'):
+                continue  # solvent and ions are never docking candidates
+            if not lig.atoms:
+                continue
+            if requested and lig.id not in requested:
+                continue
+            if not requested and session.selected_ligand_id \
+                    and lig.id == session.selected_ligand_id:
+                candidates.insert(0, lig)  # selected ligand first
+                continue
+            candidates.append(lig)
+        if not candidates:
+            raise ValueError(
+                "No dockable ligands (non-solvent, non-ion) in structure")
+
+        exhaustiveness = int(payload.get('exhaustiveness',
+                                         self.config.default_docking_exhaustiveness))
+        num_modes = int(payload.get('num_modes',
+                                    self.config.default_docking_num_modes))
+
+        # Receptor PDBQT is prepared exactly once for the whole queue
+        # (the slow Open Babel step) and shared by all ligand jobs.
+        shared_dir = session.get_job_output_dir(
+            f"vina_queue_{int(time.time())}")
+        receptor_pdbqt = shared_dir / "receptor.pdbqt"
+        vina.prepare_receptor(session.structure, receptor_pdbqt)
+
+        queued = []
+        errors = []
+        for lig in candidates:
+            try:
+                output_dir = session.get_job_output_dir(
+                    f"vina_{int(time.time())}_{lig.residue_name}")
+                job = self.job_manager.create_job(
+                    EngineType.VINA,
+                    {'ligand_id': lig.id, 'ligand_name': lig.residue_name,
+                     'exhaustiveness': exhaustiveness,
+                     'num_modes': num_modes, 'queued_batch': True},
+                    session.id,
+                )
+                session.add_job(job)
+
+                def run_fn(job: Job, params: Dict[str, Any],
+                           _lig=lig, _out=output_dir,
+                           _receptor=receptor_pdbqt):
+                    # Ligand prep (fast) runs inside the job so queueing
+                    # returns immediately and per-ligand chemistry errors
+                    # surface as that job's error, not a queue failure.
+                    input_files = vina.prepare(
+                        session.structure, _lig, _out,
+                        shared_receptor_pdbqt=_receptor)
+                    result = vina.run(input_files, {
+                        'exhaustiveness': params.get('exhaustiveness'),
+                        'num_modes': params.get('num_modes'),
+                        'output_dir': str(_out),
+                    })
+                    self.job_manager.update_progress(
+                        job.id, 1.0,
+                        f"{len(result['poses'])} poses")
+                    return result
+
+                def on_event(job_id: str, event: str, job: Job,
+                             _session=session):
+                    self._send_event('job', {
+                        'job_id': job.id,
+                        'status': job.status.value,
+                        'progress': job.progress,
+                        'error': job.error,
+                        'session_id': _session.id,
+                    })
+
+                self.job_manager.register_callback(job.id, on_event)
+                self.job_manager.start_job(job, run_fn)
+                queued.append({
+                    'job_id': job.id, 'ligand_id': lig.id,
+                    'ligand_name': lig.residue_name,
+                })
+            except Exception as e:
+                # Per-ligand failure is reported, never silently dropped.
+                errors.append({
+                    'ligand_id': lig.id,
+                    'ligand_name': lig.residue_name,
+                    'error': str(e)[:300],
+                })
+        return {
+            'queued': queued,
+            'queued_count': len(queued),
+            'failed_to_queue': errors,
+            'receptor_pdbqt': str(receptor_pdbqt),
+        }
+
+    # ------------------------------------------------------------------
+    # v2.1: discovery (RCSB search / UniProt / AlphaFold) — all live
+    # ------------------------------------------------------------------
+
+    def _handle_discover_text(self, payload, session_id) -> Dict[str, Any]:
+        text = payload.get('text') or payload.get('query') or ''
+        return self.discovery_client.search_text(
+            text, rows=int(payload.get('rows', 25)))
+
+    def _handle_discover_sequence(self, payload, session_id) -> Dict[str, Any]:
+        sequence = payload.get('sequence') or ''
+        return self.discovery_client.search_sequence(
+            sequence,
+            identity_cutoff=float(payload.get('identity_cutoff', 0.9)),
+            rows=int(payload.get('rows', 25)))
+
+    def _handle_discover_chemical(self, payload, session_id) -> Dict[str, Any]:
+        smiles = payload.get('smiles') or ''
+        return self.discovery_client.search_chemical_similarity(
+            smiles,
+            match_type=payload.get('match_type', 'fingerprint-similarity'),
+            rows=int(payload.get('rows', 25)))
+
+    def _handle_discover_similar_components(
+            self, payload, session_id) -> Dict[str, Any]:
+        """Similar CCD components for a ligand's SMILES (or a given one)."""
+        smiles = payload.get('smiles') or ''
+        if not smiles:
+            session = self._require_session(session_id)
+            if session.structure and session.selected_ligand_id:
+                lig = self._find_ligand(session, session.selected_ligand_id)
+                if lig and lig.smiles:
+                    smiles = lig.smiles
+        if not smiles:
+            raise ValueError(
+                "smiles required (or select a resolved ligand first)")
+        return self.discovery_client.search_similar_components(
+            smiles, rows=int(payload.get('rows', 25)))
+
+    def _handle_enrich_component(
+            self, payload, session_id) -> Dict[str, Any]:
+        """
+        Real identity of a CCD component (for search/discovery hit cards):
+        straight from the live CCD via the resolver's own lookup path.
+        """
+        comp_id = (payload.get('comp_id') or '').strip().upper()
+        if not comp_id or len(comp_id) > 8 or not comp_id.isalnum():
+            raise ValueError("A valid CCD component id is required")
+        data = self.ligand_resolver._lookup_ccd(comp_id)
+        if not data:
+            raise ValueError(f"CCD has no component {comp_id}")
+        data['evidence'] = [{
+            'source': 'rcsb_ccd',
+            'url': (f"{get_config().rcsb_data_url}/core/chemcomp/{comp_id}"),
+        }]
+        return data
+
+    def _handle_discover_same_ligand(
+            self, payload, session_id) -> Dict[str, Any]:
+        comp_id = payload.get('comp_id') or ''
+        if not comp_id:
+            # Default to the session's selected ligand's component.
+            session = self._require_session(session_id)
+            if session.structure and session.selected_ligand_id:
+                lig = self._find_ligand(session, session.selected_ligand_id)
+                if lig:
+                    comp_id = lig.residue_name
+        if not comp_id:
+            raise ValueError("comp_id required (or select a ligand first)")
+        return self.discovery_client.search_same_ligand(
+            comp_id, rows=int(payload.get('rows', 25)))
+
+    def _handle_entry_quality(self, payload, session_id) -> Dict[str, Any]:
+        pdb_id = payload.get('pdb_id')
+        if not pdb_id:
+            session = self._require_session(session_id)
+            if session.structure:
+                pdb_id = session.structure.id
+        if not pdb_id:
+            raise ValueError("pdb_id required (or open a structure first)")
+        return self.discovery_client.entry_quality(pdb_id)
+
+    def _handle_uniprot_context(self, payload, session_id) -> Dict[str, Any]:
+        accession = payload.get('accession')
+        if not accession:
+            # Resolve the entry's UniProt accession via RCSB SIFTS mapping.
+            session = self._require_session(session_id)
+            if not session.structure:
+                raise ValueError("accession required (or open a structure)")
+            refs = self.discovery_client.uniprot_for_entry(
+                session.structure.id)
+            if not refs:
+                raise DiscoveryError(
+                    f"No UniProt mapping for {session.structure.id}")
+            accession = refs[0]['accession']
+        return self.discovery_client.uniprot_context(accession)
+
+    def _handle_alphafold_model(self, payload, session_id) -> Dict[str, Any]:
+        accession = payload.get('accession')
+        if not accession:
+            session = self._require_session(session_id)
+            if not session.structure:
+                raise ValueError("accession required (or open a structure)")
+            refs = self.discovery_client.uniprot_for_entry(
+                session.structure.id)
+            if not refs:
+                raise DiscoveryError(
+                    f"No UniProt mapping for {session.structure.id}; "
+                    "no AlphaFold model can be looked up")
+            accession = refs[0]['accession']
+        model = self.discovery_client.fetch_alphafold_model(accession)
+        # The full file is not shipped over IPC unless explicitly requested
+        # (the payload is ~1 MB); default response is metadata + size.
+        response = {
+            'accession': model['accession'],
+            'url': model['url'],
+            'format': model['format'],
+            'source': model['source'],
+            'size_chars': len(model['content']),
+        }
+        if payload.get('include_content'):
+            response['content'] = model['content']
+        return response
+
+    # ------------------------------------------------------------------
+    # v2.2: RCSB ModelServer subsets + PDBe EU-mirror annotations
+    # ------------------------------------------------------------------
+
+    def _handle_modelserver_subset(
+            self, payload, session_id) -> Dict[str, Any]:
+        """Fetch a coordinate subset (entry/chain/component) from RCSB's
+        ModelServer as mmCIF — the efficient on-demand fetch path."""
+        pdb_id = payload.get('pdb_id')
+        session = self._get_current_session(session_id)
+        if not pdb_id and session and session.structure:
+            pdb_id = session.structure.id
+        if not pdb_id:
+            raise ValueError("pdb_id required (or open a structure)")
+        try:
+            return self.discovery_client.fetch_modelserver_subset(
+                pdb_id,
+                label_asym_id=payload.get('label_asym_id'),
+                label_comp_id=payload.get('label_comp_id'))
+        except DiscoveryError as e:
+            raise RuntimeError(str(e))
+
+    def _handle_pdbe_entry_summary(
+            self, payload, session_id) -> Dict[str, Any]:
+        """PDBe (EU mirror) entry summary for this entry."""
+        session = self._require_structure(session_id)
+        try:
+            return self.discovery_client.pdbe_entry_summary(
+                session.structure.id)
+        except DiscoveryError as e:
+            raise RuntimeError(str(e))
+
+    def _handle_pdbe_secondary_structure(
+            self, payload, session_id) -> Dict[str, Any]:
+        """PDBe's own secondary-structure annotation for this entry."""
+        session = self._require_structure(session_id)
+        try:
+            return self.discovery_client.pdbe_secondary_structure(
+                session.structure.id)
+        except DiscoveryError as e:
+            raise RuntimeError(str(e))
+
+    def _handle_pdbe_ligand_monomers(
+            self, payload, session_id) -> Dict[str, Any]:
+        """PDBe's per-chain ligand monomer listing for this entry."""
+        session = self._require_structure(session_id)
+        try:
+            return self.discovery_client.pdbe_ligand_monomers(
+                session.structure.id)
+        except DiscoveryError as e:
+            raise RuntimeError(str(e))
+
+    # ------------------------------------------------------------------
+    # v2.1: pockets (real fpocket) and DSSP (real mkdssp)
+    # ------------------------------------------------------------------
+
+    def _handle_detect_pockets(
+            self, payload, session_id) -> Dict[str, Any]:
+        session = self._require_structure(session_id)
+        ligand = None
+        if session.selected_ligand_id:
+            ligand = self._find_ligand(session, session.selected_ligand_id)
+        workdir = session.get_workspace() / "pockets"
+        result = self.pocket_detector.detect_pockets(
+            session.structure, workdir, ligand=ligand)
+        if result.get("available") and result.get("pockets"):
+            self._session_pockets[session.id] = result
+        return result
+
+    def _handle_run_dssp(self, payload, session_id) -> Dict[str, Any]:
+        session = self._require_structure(session_id)
+        workdir = session.get_workspace() / "dssp"
+        result = self.dssp_analyzer.analyze(session.structure, workdir)
+        if result.get("available") and result.get("residues"):
+            self._session_dssp[session.id] = result
+        return result
+
+    # ------------------------------------------------------------------
+    # v2.1: 2D interaction diagram from real PLIP contacts
+    # ------------------------------------------------------------------
+
+    def _handle_get_interaction_diagram(
+            self, payload, session_id) -> Dict[str, Any]:
+        session = self._require_structure(session_id)
+        contacts = self._last_contacts.get(session.id)
+        if not contacts:
+            raise ValueError(
+                "No contact analysis yet: run contact analysis first "
+                "(the diagram renders PLIP's real contacts)")
+        ligand = self._find_ligand(
+            session, self._last_contacts_ligand.get(
+                session.id, session.selected_ligand_id or ''))
+        if not ligand:
+            raise ValueError("Selected ligand not found")
+        diagram = build_interaction_diagram(
+            session.structure, ligand, contacts,
+            width=int(payload.get('width', 900)),
+            height=int(payload.get('height', 640)))
+        # Optional artifact export (real file in the workspace).
+        if payload.get('save'):
+            path = session.get_workspace() / "interaction_diagram.svg"
+            path.write_text(diagram['svg'], encoding='utf-8')
+            diagram['saved_path'] = str(path)
+        return diagram
+
+    # ------------------------------------------------------------------
+    # v2.1: batch interaction aggregation + struct_conn export
+    # ------------------------------------------------------------------
+
+    def _handle_aggregate_batch_interactions(
+            self, payload, session_id) -> Dict[str, Any]:
+        batch_id = payload.get('batch_id')
+        if not batch_id:
+            raise ValueError("batch_id is required")
+        batch = self.batch_analyzer._batch_jobs.get(batch_id)
+        if batch is None:
+            raise ValueError(f"Batch not found: {batch_id}")
+        results = self.batch_analyzer._get_results_for_batch(batch_id)
+        rows = aggregate_interaction_frequencies(results)
+        response: Dict[str, Any] = {
+            'rows': rows,
+            'row_count': len(rows),
+        }
+        if payload.get('save'):
+            session = self._require_session(session_id)
+            out = (Path(payload['output_dir'])
+                   if payload.get('output_dir')
+                   else session.get_workspace())
+            out.mkdir(parents=True, exist_ok=True)
+            path = export_frequency_csv(
+                rows, Path(out) / "interaction_frequencies.csv")
+            response['saved_path'] = str(path)
+        return response
+
+    def _handle_export_struct_conn(
+            self, payload, session_id) -> Dict[str, Any]:
+        session = self._require_structure(session_id)
+        contacts = self._last_contacts.get(session.id)
+        if not contacts:
+            raise ValueError(
+                "No contact analysis yet: run contact analysis first")
+        ligand = self._find_ligand(
+            session, self._last_contacts_ligand.get(
+                session.id, session.selected_ligand_id or ''))
+        if not ligand:
+            raise ValueError("Selected ligand not found")
+        path = session.get_workspace() / "struct_conn.cif"
+        export_struct_conn(
+            session.structure, ligand, contacts, path,
+            pdb_id=session.structure.id)
+        return {
+            'path': str(path),
+            'record_count': sum(
+                1 for c in contacts
+                if c.contact_type.value in (
+                    'hydrogen_bond', 'salt_bridge',
+                    'metal_coordination', 'halogen_bond')),
+        }
+
+    # ------------------------------------------------------------------
+    # v2.1: redocking validation + structure superposition
+    # ------------------------------------------------------------------
+
+    def _handle_compare_crystal_docked(
+            self, payload, session_id) -> Dict[str, Any]:
+        """
+        RMSD of a docked pose against the co-crystallized ligand
+        (redocking validation). Uses the session's ligand and a completed
+        docking job's pose; correspondence is element-aware because Vina
+        rewrites atom names to AutoDock types.
+        """
+        session = self._require_structure(session_id)
+        if not session.selected_ligand_id:
+            raise ValueError("No ligand selected")
+        ligand = self._find_ligand(session, session.selected_ligand_id)
+        if not ligand:
+            raise ValueError(
+                f"Selected ligand not found: {session.selected_ligand_id}")
+        job_id = payload.get('job_id')
+        pose_id = payload.get('pose_id')
+        if not job_id:
+            raise ValueError("job_id is required")
+        job = self.job_manager.get_job(job_id)
+        if not job or job.status.value != 'completed' \
+                or not isinstance(job.result, dict):
+            raise ValueError(f"Job {job_id} has no completed result")
+        poses = job.result.get('poses') or []
+        pose = None
+        if pose_id is not None:
+            pose = next((p for p in poses
+                         if p.pose_id == pose_id), None)
+        else:
+            pose = poses[0] if poses else None
+        if pose is None:
+            raise ValueError(f"Pose not found in job {job_id}")
+        comparator = ResultComparator()
+        result = comparator.compare_crystal_vs_docked(ligand, pose)
+        result['job_id'] = job_id
+        result['pose_id'] = pose.pose_id
+        result['pose_affinity'] = pose.affinity
+        return result
+
+    def _handle_superpose_structures(
+            self, payload, session_id) -> Dict[str, Any]:
+        """
+        CA superposition of a chain in this session's structure onto a
+        chain of another loaded structure (or a freshly opened PDB ID),
+        returning the real RMSD and the transform.
+        """
+        session = self._require_structure(session_id)
+        chain_a = payload.get('chain_a')
+        chain_b = payload.get('chain_b')
+        ref_pdb = payload.get('reference_pdb_id')
+        reference = None
+        if ref_pdb:
+            reference = self.parser.fetch_from_rcsb(ref_pdb)
+        else:
+            ref_session_id = payload.get('reference_session_id')
+            if not ref_session_id:
+                raise ValueError(
+                    "reference_pdb_id or reference_session_id required")
+            ref_session = self._sessions.get(ref_session_id)
+            if not ref_session or not ref_session.structure:
+                raise ValueError(
+                    f"Reference session has no structure: {ref_session_id}")
+            reference = ref_session.structure
+        if not chain_a:
+            # First polymer chain of the session's structure.
+            polymer = [c for c in session.structure.chains if c.is_polymer]
+            if not polymer:
+                raise ValueError("Structure has no polymer chains")
+            chain_a = polymer[0].id
+        if not chain_b:
+            polymer = [c for c in reference.chains if c.is_polymer]
+            if not polymer:
+                raise ValueError("Reference has no polymer chains")
+            chain_b = polymer[0].id
+        comparator = ResultComparator()
+        return comparator.superpose_structures(
+            session.structure, reference, chain_a, chain_b)
+
+    # ------------------------------------------------------------------
+    # v2.1: sequence viewer with real interaction mapping
+    # ------------------------------------------------------------------
+
+    def _handle_get_sequence_view(
+            self, payload, session_id) -> Dict[str, Any]:
+        """
+        Per-chain sequences with per-residue annotations, all from real
+        data: amino acids from the structure, contacting residues from
+        the last PLIP run, secondary structure from DSSP when run, and
+        pocket membership from the last fpocket run.
+        """
+        session = self._require_structure(session_id)
+        chains_out = []
+        for chain in session.structure.chains:
+            if not chain.is_polymer:
+                continue
+            residues = sorted(chain.residues, key=lambda r: r.id)
+            seq = []
+            per_residue = {}
+            for r in residues:
+                aa = _THREE_TO_ONE.get(r.name.upper())
+                if aa is None:
+                    continue
+                seq.append(aa)
+                per_residue[r.id] = {
+                    "index": len(seq) - 1,
+                    "name": r.name,
+                    "contacts": [],
+                    "ss": None,
+                    "in_pocket": False,
+                }
+            entry = {
+                "chain_id": chain.id,
+                "sequence": "".join(seq),
+                "length": len(seq),
+                "residues": per_residue,
+                "contacting_residues": [],
+            }
+            # Real PLIP contacts from the last analysis (this chain only).
+            contacts = self._last_contacts.get(session.id, [])
+            for c in contacts:
+                if c.protein_chain_id != chain.id:
+                    continue
+                info = per_residue.get(c.protein_residue_id)
+                if info is not None:
+                    info["contacts"].append({
+                        "type": c.contact_type.value,
+                        "distance": c.distance,
+                        "ligand_atom": c.ligand_atom,
+                        "protein_atom": c.protein_atom,
+                    })
+                    if c.protein_residue_id not in \
+                            entry["contacting_residues"]:
+                        entry["contacting_residues"].append(
+                            c.protein_residue_id)
+            chains_out.append(entry)
+
+        # DSSP per-residue SS, when DSSP was run on this session.
+        dssp = self._session_dssp.get(session.id)
+        if dssp:
+            for entry in chains_out:
+                for r in dssp.get("residues", []):
+                    info = entry["residues"].get(r["residue_id"])
+                    if info is not None and r["chain"] == entry["chain_id"]:
+                        info["ss"] = r["ss"]
+
+        # fpocket membership: which residues have any pocket atom within
+        # 4 A (computed on fpocket's own pocket atoms, once per run).
+        pockets = self._session_pockets.get(session.id)
+        if pockets:
+            import numpy as np
+            pocket_atoms = []
+            for p in pockets.get("pockets", []):
+                pocket_atoms.extend(p["coordinates"])
+            if pocket_atoms:
+                pa = np.array(pocket_atoms)
+                for chain in session.structure.chains:
+                    if not chain.is_polymer:
+                        continue
+                    entry = next((e for e in chains_out
+                                  if e["chain_id"] == chain.id), None)
+                    if entry is None:
+                        continue
+                    for residue in chain.residues:
+                        info = entry["residues"].get(residue.id)
+                        if info is None:
+                            continue
+                        ra = np.array([[a.x, a.y, a.z]
+                                       for a in residue.atoms])
+                        if ra.size and (np.sqrt(
+                                ((pa[:, None, :] - ra[None, :, :]) ** 2)
+                                .sum(-1)).min(axis=0) < 4.0).any():
+                            info["in_pocket"] = True
+
+        return {
+            "structure_id": session.structure.id,
+            "chains": [
+                {
+                    "chain_id": e["chain_id"],
+                    "sequence": e["sequence"],
+                    "length": e["length"],
+                    "contacting_residues": e["contacting_residues"],
+                    "residues": [
+                        {"id": rid, **info}
+                        for rid, info in e["residues"].items()
+                    ],
+                }
+                for e in chains_out
+            ],
+            "has_contacts": bool(self._last_contacts.get(session.id)),
+            "has_dssp": bool(dssp),
+            "has_pockets": bool(pockets),
+        }
+
+    # ------------------------------------------------------------------
+    # v2.2: BindingDB affinity records (current REST API, live)
+    # ------------------------------------------------------------------
+
+    def _handle_bindingdb_affinity(
+            self, payload, session_id) -> Dict[str, Any]:
+        """
+        Real Ki/Kd/IC50/EC50 records for this entry from BindingDB's
+        current REST web services. Queried by PDB ID first; when the
+        entry is outside BindingDB's PDB coverage, by the entry's UniProt
+        accession (resolved live via RCSB's SIFTS mapping). Failures are
+        honest errors — affinity values are never invented.
+        """
+        session = self._require_structure(session_id)
+        pdb_id = session.structure.id
+        cutoff = int(payload.get('affinity_cutoff_nm', 10000))
+
+        uniprot_accession = None
+        try:
+            refs = self.discovery_client.uniprot_for_entry(pdb_id)
+            if refs:
+                uniprot_accession = refs[0].get('accession')
+        except Exception:
+            # UniProt mapping is an optional refinement of the query; the
+            # BindingDB failure itself is reported by the except below.
+            uniprot_accession = None
+
+        try:
+            result = self.bindingdb_client.affinity_for_entry(
+                pdb_id, uniprot_accession=uniprot_accession,
+                affinity_cutoff_nm=cutoff)
+        except BindingDBError as e:
+            raise RuntimeError(str(e))
+
+        # Records matching the selected ligand's SMILES get first billing
+        # in the UI (an exact match is data, not a guess).
+        selected = None
+        if session.selected_ligand_id:
+            ligand = self._find_ligand(session, session.selected_ligand_id)
+            if ligand and ligand.smiles:
+                selected = ligand.smiles
+        records = result.get('records', [])
+        for r in records:
+            r['matches_selected_ligand'] = bool(
+                selected and r.get('smiles') and
+                r['smiles'].strip() == selected.strip())
+        records.sort(key=lambda r: not r['matches_selected_ligand'])
+
+        result['uniprot_accession'] = uniprot_accession
+        return result
+
+    # ------------------------------------------------------------------
+    # v2.2: covalent-ligand handling (from the file's own records)
+    # ------------------------------------------------------------------
+
+    def _handle_get_covalent_links(
+            self, payload, session_id) -> Dict[str, Any]:
+        """
+        Covalent connections the structure file itself declares (mmCIF
+        `_struct_conn` covale/disulf rows, or PDB LINK records) between
+        the structure's ligand components and the polymer — depositor
+        data, never distance-guessed.
+        """
+        session = self._require_structure(session_id)
+        detection = detect_covalent_links(session.structure)
+
+        # Per-selected-ligand flag for the ligand card.
+        selected_links = []
+        if session.selected_ligand_id:
+            ligand = self._find_ligand(session, session.selected_ligand_id)
+            if ligand:
+                selected_links = covalent_flag_for_ligand(
+                    session.structure, ligand.residue_name, detection)
+
+        return {
+            **detection,
+            'selected_ligand_covalent': selected_links,
+            'selected_ligand_is_covalent': bool(selected_links),
+        }
+
+    # ------------------------------------------------------------------
+    # v2.2: GROMACS minimization / short MD (real engine, as a job)
+    # ------------------------------------------------------------------
+
+    def _handle_run_md(
+            self, payload, session_id) -> Dict[str, Any]:
+        session = self._require_structure(session_id)
+        if not self.md_adapter.is_available():
+            raise RuntimeError(
+                "GROMACS (gmx) is not installed. Install it (e.g. "
+                "'apt install gromacs') or set LIGORA_GMX_PATH — "
+                "minimization/MD is never simulated.")
+
+        mode = (payload.get('mode') or 'em').lower()
+        job = self.job_manager.create_job(
+            EngineType.GROMACS,
+            {k: v for k, v in payload.items() if k != 'session_id'},
+            session.id,
+        )
+        session.add_job(job)
+
+        # Run in GROMACS's own subdirectory of the workspace.
+        workdir = session.get_workspace() / f"md_{mode}_{int(time.time())}"
+
+        def run_fn(job: Job, run_params: Dict[str, Any]):
+            result = self.md_adapter.run(
+                session.structure, workdir,
+                mode=run_params.get('mode', 'em'),
+                force_field=run_params.get('force_field'),
+                water_model=run_params.get('water_model'),
+                nsteps=run_params.get('nsteps'),
+                emtol=run_params.get('emtol'),
+                dt=run_params.get('dt'),
+                gen_temp=run_params.get('gen_temp'),
+                timeout_seconds=run_params.get('timeout_seconds'),
+                progress_cb=lambda label: self.job_manager.update_progress(
+                    job.id, 0.5, label),
+            )
+            if result.get('error'):
+                raise RuntimeError(result['error'])
+            self.job_manager.update_progress(
+                job.id, 1.0,
+                f"{result.get('mode')} done in "
+                f"{result.get('runtime_seconds', 0):.1f}s")
+            return result
+
+        def on_event(job_id: str, event: str, job: Job):
+            self._send_event('job', {
+                'job_id': job.id,
+                'status': job.status.value,
+                'progress': job.progress,
+                'error': job.error,
+                'session_id': session.id,
+            })
+
+        self.job_manager.register_callback(job.id, on_event)
+        self.job_manager.start_job(job, run_fn)
+
+        return {
+            'job_id': job.id,
+            'status': 'running',
+            'message': f'GROMACS {mode} started (real engine)',
+        }
+
+    # ------------------------------------------------------------------
+    # v2.2: reproducible-analysis manifest
+    # ------------------------------------------------------------------
+
+    def _handle_export_repro_manifest(
+            self, payload, session_id) -> Dict[str, Any]:
+        """Write a "reproduce this analysis" manifest for the session."""
+        session = self._require_structure(session_id)
+        contacts = self._last_contacts.get(session.id)
+        result = write_repro_manifest(
+            session,
+            last_contacts_count=(len(contacts)
+                                 if contacts is not None else None),
+            last_contacts_ligand=self._last_contacts_ligand.get(session.id),
+            output_path=(Path(payload['output_path'])
+                         if payload.get('output_path') else None),
+        )
+        return {
+            'path': result['path'],
+            'sha256': result['sha256'],
+            'job_count': len(result['manifest'].get('jobs', [])),
+            'artifact_count': len(result['manifest'].get('artifacts', {})),
+        }
+
     def _handle_get_status(
         self,
         payload: Dict[str, Any],
@@ -925,6 +1877,8 @@ class BackendServer:
                                  if session.structure else None),
                 'selected_ligand_id': session.selected_ligand_id,
                 'notes': session.notes,
+                'viewer_only': (session.structure.viewer_only
+                                if session.structure else False),
             }
 
         vina = self.engine_registry.get_adapter(EngineType.VINA)
@@ -935,6 +1889,8 @@ class BackendServer:
         engines_out['openbabel'] = {
             'available': self.cheminformatics.is_obabel_available()}
         engines_out['rdkit'] = {'available': True}
+        engines_out['gromacs'] = {
+            'available': self.md_adapter.is_available()}
 
         return {
             'session': session_payload,
@@ -956,22 +1912,14 @@ class BackendServer:
         session = self._require_structure(session_id)
 
         # Water names come from the CCD classification of the structure's own
-        # components (pdbx_type == HETAS = solvent), not a local list.
+        # components (pdbx_type == HETAS = solvent), not a local list. The
+        # parser emits every non-polymer molecule instance (waters included)
+        # as its own ligand object, and the loader resolves each one against
+        # the live CCD, so this set is fully data-derived.
         water_names = set()
         for ligand in session.structure.ligands:
             if ligand.classification_hint == 'HETAS':
                 water_names.add(ligand.residue_name)
-        # Waters parsed from the structure but not resolved as ligand
-        # instances: residue-level scan for component names whose atoms are
-        # a single oxygen named 'O' (the structure file's own data).
-        for chain in session.structure.chains:
-            if chain.is_polymer:
-                continue
-            for residue in chain.residues:
-                atoms = residue.atoms
-                if (len(atoms) == 1 and atoms[0].name == 'O' and
-                        (atoms[0].element or '').upper() == 'O'):
-                    water_names.add(residue.name)
 
         analyzer = WaterNetworkAnalyzer(
             water_names=sorted(water_names),
@@ -1096,6 +2044,38 @@ class BackendServer:
         out_path = session.get_workspace() / 'edited_ligand.sdf'
         out_path.write_text(sdf, encoding='utf-8')
         return {'path': str(out_path)}
+
+    def _handle_editor_sync_to_3d(
+        self,
+        payload: Dict[str, Any],
+        session_id: str,
+    ) -> Dict[str, Any]:
+        """
+        Produce the edited molecule as viewer-loadable SDF content for the
+        3D scene sync path. The geometry is the editor's own atom positions
+        (z from the source ligand, preserved through edits); the chemistry
+        is what the editor's bond graph says. The viewer overlays it as a
+        separate model — nothing in the original structure is modified.
+        """
+        session = self._require_session(session_id)
+        editor = self._get_editor(session)
+        state = editor.get_state()
+        if not state['atoms']:
+            raise ValueError(
+                "The 2D editor is empty; load a ligand first")
+        try:
+            sdf = editor.export_sdf()
+        except ValueError as e:
+            raise ValueError(
+                f"Edited molecule is not chemically valid: {e}")
+        return {
+            'format': 'sdf',
+            'content': sdf,
+            'atom_count': len(state['atoms']),
+            'bond_count': len(state['bonds']),
+            'sync_enabled': state['sync_enabled'],
+            'source': '2D editor state (real edited geometry + bonds)',
+        }
 
     # ------------------------------------------------------------------
     # v2: batch analysis
@@ -1276,7 +2256,13 @@ class BackendServer:
         chem_names = list(payload.get('chem_names') or [])
         if session and session.structure:
             pdb_ids.append(session.structure.id)
+            seen_names = set()
             for lig in session.structure.ligands:
+                if lig.classification_hint == 'HETAS':
+                    continue  # water molecules are not chemistry documents
+                if lig.residue_name in seen_names:
+                    continue
+                seen_names.add(lig.residue_name)
                 chem_names.append(lig.residue_name)
         if not pdb_ids and not chem_names:
             raise ValueError(
@@ -1311,11 +2297,40 @@ class BackendServer:
 
         comparator = ResultComparator()
         comparison = comparator.compare_poses(_result(job_a), _result(job_b))
-        return {
+        result = {
             'comparison': comparison,
             'best_matches': comparison.get('best_matches', []),
             'avg_rmsd': comparison.get('avg_rmsd'),
         }
+
+        # Spec'd pose/aggregate comparison: clustering + consensus over the
+        # union of both jobs' poses (thresholds are caller-configurable, no
+        # buried chemistry).
+        try:
+            comparator.add_result(_result(job_a))
+            comparator.add_result(_result(job_b))
+            threshold = float(payload.get('cluster_rmsd_threshold', 2.0))
+            clusters = comparator.cluster_results(rmsd_threshold=threshold)
+            consensus = comparator.consensus_pose(weight_by_energy=True)
+            result['clusters'] = clusters
+            result['consensus_pose'] = (
+                {'pose_id': consensus.pose_id,
+                 'affinity': consensus.affinity,
+                 'ligand_name': consensus.ligand_name,
+                 'atoms': [
+                     {'name': a.name, 'element': a.element,
+                      'x': a.x, 'y': a.y, 'z': a.z}
+                     for a in consensus.atoms
+                 ]} if consensus else None)
+            result['cluster_rmsd_threshold'] = threshold
+        except (ValueError, KeyError, TypeError) as e:
+            # Clustering is an addition to the pairwise comparison, not a
+            # gate on it: a geometry edge case degrades the extra fields,
+            # never the core comparison.
+            result['clusters'] = []
+            result['consensus_pose'] = None
+            result['clustering_note'] = f"clustering unavailable: {e}"
+        return result
 
     @staticmethod
     def _scripting_context(session: Optional[Session]) -> Dict[str, Any]:
@@ -1338,6 +2353,7 @@ class BackendServer:
             'title': structure.title,
             'source': structure.source,
             'file_format': structure.file_format,
+            'viewer_only': structure.viewer_only,
             'resolution': structure.resolution,
             'experiment_type': structure.experiment_type,
             'chains': [

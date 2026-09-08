@@ -27,6 +27,7 @@ from .schemas import (
     LigandResolutionStatus
 )
 from .config import get_config
+from .net import http_timeout
 
 
 class StructureParser:
@@ -188,16 +189,28 @@ class StructureParser:
                     chain.residues.append(residue)
                 residue.atoms.append(atom)
             else:
-                # Non-polymer entity: group by (component, instance chain).
-                key = (comp_id, chain_id)
+                # Non-polymer entity: group by the file's own residue
+                # instance (component, chain, residue number). Separate
+                # molecules of the same component (e.g. eight glycerols)
+                # must stay separate molecules - merging them produces a
+                # multi-molecule chimera on which no chemistry is valid.
+                key = (comp_id, chain_id, residue_number)
                 ligand_atoms.setdefault(key, []).append(atom)
 
         # Build candidate ligands from the file's own non-polymer groups.
         # Identity/classification values (formula, weight, SMILES, type) are
-        # attached later by the resolver from the live CCD.
-        for (comp_id, chain_id), atoms in ligand_atoms.items():
+        # attached later by the resolver from the live CCD. Every non-polymer
+        # molecule instance is its own ligand object: the file's residue
+        # identity (component, chain, residue number) defines the molecule,
+        # and no component is special-cased by name here — what is solvent,
+        # ion, or organic is decided only by the CCD's pdbx_type during
+        # resolution.
+        for (comp_id, chain_id, residue_number), atoms \
+                in ligand_atoms.items():
+            suffix = f"_{residue_number}" if residue_number is not None \
+                else ""
             ligand = Ligand(
-                id=f"L{comp_id}_{chain_id}" if chain_id else f"L{comp_id}",
+                id=f"L{comp_id}_{chain_id}{suffix}",
                 name=comp_id,
                 residue_name=comp_id,
                 formula=None,
@@ -284,7 +297,7 @@ class StructureParser:
                 )
 
                 if record == "HETATM":
-                    key = (residue_name, chain_id)
+                    key = (residue_name, chain_id, residue_number)
                     ligand_atoms.setdefault(key, []).append(atom)
                 else:
                     chain = chains.get(chain_id)
@@ -335,9 +348,17 @@ class StructureParser:
 
         structure.chains = list(chains.values())
 
-        for (comp_id, chain_id), atoms in ligand_atoms.items():
+        # Build candidate ligands from the file's own non-polymer groups.
+        # Identity/classification values (formula, weight, SMILES, type) are
+        # attached later by the resolver from the live CCD. Every non-polymer
+        # molecule instance is its own ligand object; no component is
+        # special-cased by name — classification is the CCD's decision.
+        for (comp_id, chain_id, residue_number), atoms \
+                in ligand_atoms.items():
+            suffix = f"_{residue_number}" if residue_number is not None \
+                else ""
             ligand = Ligand(
-                id=f"L{comp_id}_{chain_id}" if chain_id else f"L{comp_id}",
+                id=f"L{comp_id}_{chain_id}{suffix}",
                 name=comp_id,
                 residue_name=comp_id,
                 formula=None,
@@ -372,7 +393,7 @@ class StructureParser:
 
         try:
             response = requests.get(
-                download_url, timeout=config.request_timeout)
+                download_url, timeout=http_timeout(config.request_timeout))
             response.raise_for_status()
         except requests.RequestException as e:
             raise RuntimeError(f"Failed to fetch {pdb_id} from RCSB: {e}")

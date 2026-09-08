@@ -67,10 +67,16 @@ class ContactAnalyzer:
     # ------------------------------------------------------------------
 
     def _plip_command(self) -> Optional[str]:
-        """Resolve the PLIP executable (explicit config or PATH)."""
+        """
+        Resolve the PLIP executable (explicit config or PATH). An explicit
+        configuration is honored only when the file actually exists — a
+        stale path must read as 'unavailable', never as a crash later.
+        """
         config = get_config()
         if config.plip_executable:
-            return config.plip_executable
+            if Path(config.plip_executable).exists():
+                return config.plip_executable
+            return None
         return shutil.which("plip")
 
     def is_plip_available(self) -> bool:

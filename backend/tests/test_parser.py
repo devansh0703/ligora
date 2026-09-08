@@ -93,12 +93,18 @@ class TestStructureParser:
         assert [a.element for a in ligand.atoms] == ["C", "N", "O"]
 
     def test_parse_pdb_water_grouping(self):
-        """Waters become non-polymer instances; elements come from the file."""
+        """Each water molecule is its own non-polymer instance.
+
+        Separate solvent molecules (HOH 201, HOH 202) must never be merged
+        into one multi-molecule ligand: per-molecule chemistry (bond
+        perception, docking prep) is only valid on a real single molecule.
+        """
         structure = self.parser.parse_pdb(PDB_CONTENT)
         waters = [lig for lig in structure.ligands if lig.residue_name == "HOH"]
-        assert len(waters) == 1  # grouped per (component, chain)
-        assert waters[0].atom_count == 2
-        assert all(a.element == "O" for a in waters[0].atoms)
+        assert len(waters) == 2  # one instance per (component, chain, residue)
+        assert {w.id for w in waters} == {"LHOH_A_201", "LHOH_A_202"}
+        assert all(w.atom_count == 1 for w in waters)
+        assert all(a.element == "O" for w in waters for a in w.atoms)
 
     def test_parse_pdb_keeps_last_residue(self):
         """Regression: the final residue of a PDB chain must not be lost."""

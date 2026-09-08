@@ -121,6 +121,15 @@ class BatchAnalyzer:
                     ))
                     continue
 
+                # Resolve every non-polymer instance against the live CCD
+                # first (same as the app loader) so classification is real
+                # data, then pick the primary ligand from classified ones.
+                for ligand_instance in structure.ligands:
+                    self.ligand_resolver.resolve_ligand(
+                        ligand_instance,
+                        structure.id if structure.id else None,
+                    )
+
                 # Get primary ligand
                 ligand = self._get_primary_ligand(structure)
 
@@ -146,7 +155,9 @@ class BatchAnalyzer:
                         "PLIP is not installed; contact analysis cannot "
                         "run - results are never simulated")
 
-                # Resolve ligand identity
+                # Resolve ligand identity (the pre-selection pass already
+                # resolved every instance; this is the resolver's cached
+                # identity path for the chosen primary ligand).
                 enriched_ligand = self.ligand_resolver.resolve_ligand(
                     ligand, structure.id if structure.id else None
                 )
@@ -180,6 +191,8 @@ class BatchAnalyzer:
                             'contact_type': c.contact_type.value,
                             'distance': c.distance,
                             'protein_residue': c.protein_residue_name,
+                            'residue_id': c.protein_residue_id,
+                            'protein_chain': c.protein_chain_id,
                             'ligand_residue': c.ligand_residue_name,
                         }
                         for c in contacts
@@ -258,18 +271,14 @@ class BatchAnalyzer:
     def _get_primary_ligand(self, structure: Structure) -> Optional[Ligand]:
         """Pick the most relevant non-polymer ligand for batch analysis.
 
-        The app does not classify ligands from hardcoded chemical knowledge.
-        It uses only the classification_hint that was attached earlier by the
-        resolver/enrichment layer from external sources where available.
+        Classification comes from the live CCD via the resolver (pdbx_type
+        codes): solvent (HETAS) and ions (HETAI) are never analysis targets.
         """
         for ligand in structure.ligands:
-            hint = ligand.classification_hint
-            if hint and hint not in ("unclassified", "solvent", "ion"):
+            if ligand.classification_hint in ('HETAS', 'HETAI'):
+                continue
+            if ligand.atoms:
                 return ligand
-
-        if structure.ligands:
-            return structure.ligands[0]
-
         return None
 
     def export_batch_results(
@@ -290,8 +299,10 @@ class BatchAnalyzer:
         summary_data = {
             'batch_id': batch.id,
             'total_tasks': len(batch.tasks),
-            'completed': sum(1 for t in batch.tasks if t.status == BatchTaskStatus.COMPLETED),
-            'failed': sum(1 for t in batch.tasks if t.status == BatchTaskStatus.FAILED),
+            'completed': sum(
+                1 for t in batch.tasks if t.status == BatchTaskStatus.COMPLETED),
+            'failed': sum(
+                1 for t in batch.tasks if t.status == BatchTaskStatus.FAILED),
             'results': [
                 {
                     'task_id': r.task_id,

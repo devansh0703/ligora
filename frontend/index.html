@@ -19,6 +19,17 @@
                 <span>Ligora</span>
             </div>
             <div class="menu-group">
+                <input class="input" id="topbar-search" type="text"
+                    placeholder="Search PDB-wide (text)…" style="max-width:180px">
+                <button class="btn btn-secondary" id="btn-topbar-search" title="Search the PDB">Search</button>
+            </div>
+            <div class="menu-group">
+                <select id="select-recent" class="select" title="Recently opened structures">
+                    <option value="">Recent…</option>
+                </select>
+                <button class="btn btn-secondary" id="btn-settings" title="Data-source & engine settings">⚙</button>
+            </div>
+            <div class="menu-group">
                 <button class="btn btn-secondary" id="btn-open-file">
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                         <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
@@ -51,6 +62,14 @@
                     <option value="residue">By Residue</option>
                     <option value="atomindex">By Atom Index</option>
                 </select>
+                <select id="select-camera-preset" class="select" title="Camera preset views">
+                    <option value="">View…</option>
+                    <option value="ligand">Ligand focus</option>
+                    <option value="pocket">Pocket site</option>
+                    <option value="interface">Interface</option>
+                    <option value="all">Whole structure</option>
+                </select>
+                <button class="btn btn-secondary" id="btn-pocket-surface" title="Toggle the ligand-centric pocket surface">Pocket surface</button>
             </div>
             <div class="menu-group">
                 <button class="btn btn-secondary" id="btn-measure">
@@ -119,6 +138,9 @@
                             Run contact analysis to see interactions
                         </div>
                     </div>
+                    <div class="v2-actions" style="margin-top:6px">
+                        <button class="btn btn-secondary btn-sm" id="btn-contacts-csv">Export CSV</button>
+                    </div>
                 </div>
                 <div class="panel-section">
                     <h3>
@@ -170,6 +192,9 @@
                 <button class="v2-tab" data-tab="compare">Compare</button>
                 <button class="v2-tab" data-tab="docking">Docking</button>
                 <button class="v2-tab" data-tab="search">Search</button>
+                <button class="v2-tab" data-tab="discover">Discover</button>
+                <button class="v2-tab" data-tab="pockets">Pockets</button>
+                <button class="v2-tab" data-tab="structure">Structure</button>
             </div>
             <div class="v2-panel v2-hidden" id="v2-panel-batch">
                 <div class="v2-row">
@@ -199,6 +224,7 @@
             <div class="v2-panel v2-hidden" id="v2-panel-editor">
                 <div class="v2-row v2-actions">
                     <button class="btn btn-secondary" id="btn-editor-load">Load Selected Ligand</button>
+                    <button class="btn btn-primary" id="btn-editor-sync">Sync to 3D</button>
                     <button class="btn btn-primary" id="btn-editor-export">Export SDF</button>
                 </div>
                 <div class="v2-row editor-toolbar">
@@ -238,9 +264,25 @@
                 </div>
                 <div class="v2-row v2-actions">
                     <button class="btn btn-primary" id="btn-compare-run">Compare Poses</button>
+                    <button class="btn btn-secondary" id="btn-cluster-run">Cluster + Consensus</button>
+                    <label class="v2-label">RMSD Å</label>
+                    <input class="input" id="cluster-threshold" type="number" step="0.5" min="0.5" value="2.0" style="max-width:70px">
                 </div>
                 <div class="v2-results" id="compare-results">
                     <div class="v2-placeholder">Run two Vina docking jobs first, then compare their poses (RMSD + affinity).</div>
+                </div>
+                <div class="v2-row">
+                    <label class="v2-label">Superpose chain</label>
+                    <input class="input" id="superpose-chain-a" type="text" placeholder="A (this structure)" style="max-width:160px">
+                    <label class="v2-label">onto PDB ID / chain</label>
+                    <input class="input" id="superpose-ref" type="text" placeholder="e.g. 3W76" style="max-width:110px">
+                    <input class="input" id="superpose-chain-b" type="text" placeholder="A" style="max-width:70px">
+                </div>
+                <div class="v2-row v2-actions">
+                    <button class="btn btn-secondary" id="btn-superpose-run">Superpose Structures</button>
+                </div>
+                <div class="v2-results" id="superpose-results">
+                    <div class="v2-placeholder">CA superposition of a chain onto another structure's chain (fetched live by PDB ID): NW sequence alignment → seed-and-extend core fit → real RMSD, identity and transform.</div>
                 </div>
             </div>
             <div class="v2-panel v2-hidden" id="v2-panel-docking">
@@ -250,13 +292,43 @@
                     <label class="v2-label">Modes</label>
                     <input class="input" id="dock-num-modes" type="number" min="1" max="20" value="5" style="max-width:80px">
                     <button class="btn btn-primary" id="btn-dock-run">Run Docking</button>
+                    <button class="btn btn-secondary" id="btn-dock-queue">Dock All Ligands</button>
+                </div>
+                <div class="v2-row">
+                    <label class="v2-label">Box center x/y/z</label>
+                    <input class="input" id="box-cx" type="number" step="0.1" style="max-width:80px" placeholder="auto">
+                    <input class="input" id="box-cy" type="number" step="0.1" style="max-width:80px" placeholder="auto">
+                    <input class="input" id="box-cz" type="number" step="0.1" style="max-width:80px" placeholder="auto">
+                    <label class="v2-label">size</label>
+                    <input class="input" id="box-sx" type="number" step="0.5" min="1" style="max-width:70px" placeholder="22.5">
+                    <input class="input" id="box-sy" type="number" step="0.5" min="1" style="max-width:70px" placeholder="22.5">
+                    <input class="input" id="box-sz" type="number" step="0.5" min="1" style="max-width:70px" placeholder="22.5">
+                    <button class="btn btn-secondary btn-sm" id="btn-box-apply">Apply Box</button>
+                    <button class="btn btn-secondary btn-sm" id="btn-box-reset">Use Ligand Extent</button>
                 </div>
                 <div class="v2-row v2-progress" id="dock-progress" style="display:none">
                     <span class="spinner"></span>
                     <span class="v2-progress-text" id="dock-progress-text">Running real AutoDock Vina…</span>
                 </div>
                 <div class="v2-results" id="dock-results">
-                    <div class="v2-placeholder">Docks the selected ligand into the structure (box from the ligand's own extent). Requires Vina + Open Babel; results come only from the real engine.</div>
+                    <div class="v2-placeholder">Docks the selected ligand into the structure (box from the ligand's own extent, or your override below). “Dock All Ligands” queues every non-solvent, non-ion ligand as its own real Vina job. Requires Vina + Open Babel; results come only from the real engine.</div>
+                </div>
+                <div class="v2-row v2-actions" id="crystal-dock-row" style="display:none">
+                    <button class="btn btn-secondary" id="btn-crystal-dock">Compare crystal vs docked (redocking RMSD)</button>
+                </div>
+                <div class="v2-results" id="crystal-dock-results"></div>
+                <div class="v2-row">
+                    <label class="v2-label">MD mode</label>
+                    <select class="select" id="md-mode" style="max-width:120px">
+                        <option value="em">Minimize (EM)</option>
+                        <option value="md">Short vacuum MD</option>
+                    </select>
+                    <label class="v2-label">Steps</label>
+                    <input class="input" id="md-steps" type="number" min="100" value="5000" style="max-width:90px">
+                    <button class="btn btn-secondary" id="btn-md-run">Run GROMACS</button>
+                </div>
+                <div class="v2-results" id="md-results">
+                    <div class="v2-placeholder">Real GROMACS minimization / short vacuum MD on the structure's polymer (pdb2gmx → grompp → mdrun → gmx energy). Vacuum analysis aid — not solvated production dynamics. Requires gmx; when absent this says so.</div>
                 </div>
             </div>
             <div class="v2-panel v2-hidden" id="v2-panel-search">
@@ -276,7 +348,60 @@
                     <span class="v2-progress-text" id="search-status"></span>
                 </div>
                 <div class="v2-results" id="search-results">
-                    <div class="v2-placeholder">Search indexes documents fetched live from RCSB/PubChem plus your workspace artifacts. Click “Index current session” first.</div>
+                    <div class="v2-placeholder">Search indexes documents fetched live from RCSB/PubChem plus your workspace artifacts. Click “Index current session” first. Structure hits open the entry; chemical hits open an enrichment card.</div>
+                </div>
+            </div>
+            <div class="v2-panel v2-hidden" id="v2-panel-discover">
+                <div class="v2-row">
+                    <select class="select" id="discover-mode" style="max-width:190px">
+                        <option value="text">PDB text search</option>
+                        <option value="sequence">Sequence (MMseqs2)</option>
+                        <option value="chemical">Chemical similarity</option>
+                        <option value="same_ligand">Same ligand (this one)</option>
+                        <option value="similar_components">Similar CCD components</option>
+                    </select>
+                    <input class="input" id="discover-input" type="text"
+                        placeholder="Query: text / FASTA sequence / SMILES">
+                </div>
+                <div class="v2-row v2-actions">
+                    <button class="btn btn-primary" id="btn-discover-run">Search PDB-wide</button>
+                    <span class="v2-progress-text" id="discover-status"></span>
+                </div>
+                <div class="v2-results" id="discover-results">
+                    <div class="v2-placeholder">Live RCSB Search API queries over the whole PDB: full-text, MMseqs2 sequence, OpenEye chemical similarity, same-ligand entry discovery, and similar CCD components. Structure hits open in the viewer; component hits load as enrichment cards.</div>
+                </div>
+            </div>
+            <div class="v2-panel v2-hidden" id="v2-panel-pockets">
+                <div class="v2-row v2-actions">
+                    <button class="btn btn-primary" id="btn-pockets-run">Detect Pockets (fpocket)</button>
+                    <button class="btn btn-secondary" id="btn-dssp-run">Secondary Structure (DSSP)</button>
+                </div>
+                <div class="v2-results" id="pockets-results">
+                    <div class="v2-placeholder">fpocket detects pockets from the real structure geometry; DSSP assigns real secondary structure. Both are external engines — when absent, this tab says so.</div>
+                </div>
+            </div>
+            <div class="v2-panel v2-hidden" id="v2-panel-structure">
+                <div class="v2-row v2-actions">
+                    <button class="btn btn-primary" id="btn-diagram-run">2D Interaction Diagram</button>
+                    <button class="btn btn-secondary" id="btn-sequence-run">Sequence View</button>
+                </div>
+                <div class="v2-row v2-actions">
+                    <button class="btn btn-secondary" id="btn-quality-run">Structure Quality (RCSB validation)</button>
+                    <button class="btn btn-secondary" id="btn-uniprot-run">Protein Context (UniProt)</button>
+                    <button class="btn btn-secondary" id="btn-alphafold-run">AlphaFold Model</button>
+                </div>
+                <div class="v2-row v2-actions">
+                    <button class="btn btn-secondary" id="btn-bindingdb-run">BindingDB Affinities</button>
+                    <button class="btn btn-secondary" id="btn-covale-run">Covalent Links</button>
+                    <button class="btn btn-secondary" id="btn-manifest-run">Reproducibility Manifest</button>
+                </div>
+                <div class="v2-row v2-actions">
+                    <button class="btn btn-secondary" id="btn-pdbe-run">PDBe Entry (EU mirror)</button>
+                    <button class="btn btn-secondary" id="btn-modelserver-run">Fetch Subset (ModelServer)</button>
+                    <button class="btn btn-secondary" id="btn-scene-image">Export Scene PNG</button>
+                </div>
+                <div class="v2-results" id="structure-results">
+                    <div class="v2-placeholder">Publication-style 2D interaction diagram (from PLIP's own contacts), per-chain sequence with interaction/SS/pocket mapping, RCSB validation metrics, UniProt protein context and AlphaFold model metadata — all live.</div>
                 </div>
             </div>
         </div>

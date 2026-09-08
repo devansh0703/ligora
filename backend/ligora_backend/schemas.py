@@ -22,6 +22,7 @@ class EngineType(str, Enum):
     OPENMM = "openmm"
     PYSCF = "pyscf"
     GEOMETRY_CLEANUP = "geometry_cleanup"
+    GROMACS = "gromacs"
 
 
 class ContactType(str, Enum):
@@ -94,7 +95,8 @@ class Ligand:
     pubchem_name: Optional[str] = None
     chembl_id: Optional[str] = None
     pdbbind_affinity: Optional[float] = None
-    classification_hint: Optional[str] = None  # Must come from data sources (CCD/PubChem/ChEMBL)
+    # Must come from data sources (CCD/PubChem/ChEMBL), never local guesses:
+    classification_hint: Optional[str] = None
     has_2d_structure: bool = False
     iupac_name: Optional[str] = None
 
@@ -112,6 +114,9 @@ class Structure:
     experiment_type: Optional[str] = None
     file_path: Optional[str] = None
     file_format: str = "mmcif"
+    # True when the format is viewable in the 3D viewer but not parseable
+    # into the full analysis model (no chains/ligands/contacts).
+    viewer_only: bool = False
 
 
 @dataclass
