@@ -12,6 +12,10 @@ jobs:
     strategy:
       matrix:
         python-version: ['3.10', '3.11', '3.12']
+      # The tests hit live EBI/RCSB/PubChem services, which rate-limit.
+      # Running the versions in parallel triples the request pressure and
+      # causes transient 'unavailable' flakes; run them one at a time.
+      max-parallel: 1
 
     steps:
       - uses: actions/checkout@v4

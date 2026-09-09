@@ -270,34 +270,45 @@ class EnrichmentClient:
     def _get_chembl_by_id(self, chembl_id: str) -> Optional[Dict[str, Any]]:
         config = get_config()
         url = f"{config.chembl_base_url}/molecule/{chembl_id}.json"
-        try:
-            response = self._session.get(
-                url, timeout=http_timeout(config.request_timeout))
-            if response.status_code != 200:
-                return None
-            data = response.json()
-            # The molecule is the top-level object when fetched by ID; the
-            # list endpoints wrap records in a 'molecule' key instead.
-            molecule = (data.get('molecule')
-                        if isinstance(data, dict) and 'molecule' in data
-                        else data)
-            molecule = molecule or {}
-            props = (molecule.get('molecule_properties') or {})
-            structs = (molecule.get('molecule_structures') or {})
-            return {
-                'chembl_id': chembl_id,
-                'pref_name': molecule.get('pref_name'),
-                'smiles': props.get('canonical_smiles') or structs.get(
-                    'canonical_smiles'),
-                'molecular_weight': props.get('full_mwt'),
-                'formula': props.get('full_molformula'),
-                'alogp': props.get('alogp'),
-                'hba': props.get('hba'),
-                'hbd': props.get('hbd'),
-                'source': 'chembl',
-            }
-        except (requests.RequestException, ValueError):
+        # EBI rate-limits bursty traffic; one honest retry before reporting
+        # the record as missing (which would turn a transient timeout into a
+        # wrong 'no data' answer).
+        for _attempt in range(2):
+            try:
+                response = self._session.get(
+                    url, timeout=http_timeout(config.request_timeout))
+                if response.status_code == 200:
+                    break
+            except requests.RequestException:
+                continue
+        else:
             return None
+        if response.status_code != 200:
+            return None
+        try:
+            data = response.json()
+        except ValueError:
+            return None
+        # The molecule is the top-level object when fetched by ID; the
+        # list endpoints wrap records in a 'molecule' key instead.
+        molecule = (data.get('molecule')
+                    if isinstance(data, dict) and 'molecule' in data
+                    else data)
+        molecule = molecule or {}
+        props = (molecule.get('molecule_properties') or {})
+        structs = (molecule.get('molecule_structures') or {})
+        return {
+            'chembl_id': chembl_id,
+            'pref_name': molecule.get('pref_name'),
+            'smiles': props.get('canonical_smiles') or structs.get(
+                'canonical_smiles'),
+            'molecular_weight': props.get('full_mwt'),
+            'formula': props.get('full_molformula'),
+            'alogp': props.get('alogp'),
+            'hba': props.get('hba'),
+            'hbd': props.get('hbd'),
+            'source': 'chembl',
+        }
 
     def _get_chembl_by_smiles(self, smiles: str) -> Optional[Dict[str, Any]]:
         """ChEMBL similarity search by SMILES."""
