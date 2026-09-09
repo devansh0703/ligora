@@ -1,0 +1,28 @@
+#!/bin/bash
+# Ligora snap launcher: wires the real engine paths and starts the
+# Tauri app, which spawns the Python backend via LIGORA_* variables.
+# Runs as the app command AFTER the command-chain (gpu wrapper +
+# desktop launcher) has fully set up the GNOME/GL environment.
+export LIGORA_BASE_DIR="${LIGORA_BASE_DIR:-$SNAP_USER_COMMON}"
+export LIGORA_BACKEND_DIR="$SNAP/usr/lib/ligora-backend"
+export LIGORA_PYTHON="$SNAP/usr/bin/python3"
+export PATH="$SNAP/usr/sbin:$SNAP/usr/bin:$SNAP/sbin:$SNAP/bin:$PATH"
+# Open Babel needs its own share dir for format plugins.
+export BABEL_DATADIR="$SNAP/usr/share/openbabel"
+# Open Babel's format plugins live in a versioned dir; the compiled-in
+# path points at /usr/lib (the base rootfs) which lacks them inside
+# confinement, so point BABEL_LIBDIR at the snap copy explicitly.
+for _d in "$SNAP"/usr/lib/x86_64-linux-gnu/openbabel/*/; do
+    [ -d "$_d" ] && export BABEL_LIBDIR="$_d" && break
+done
+# Ubuntu ships PLIP as `plipcmd`; the backend honours PLIP_PATH.
+export PLIP_PATH="${PLIP_PATH:-$SNAP/usr/bin/plipcmd}"
+# GROMACS data files staged from the distro package.
+export GMXDATA="${GMXDATA:-$SNAP/usr/share/gromacs}"
+export LD_LIBRARY_PATH="$SNAP/usr/lib/$SNAP_LAUNCHER_ARCH_TRIPLET:${LD_LIBRARY_PATH:-}"
+# Opt-in X11 mode (UI automation / testing); Wayland is the default and
+# is set by the platform launcher just before this wrapper runs.
+if [ "${LIGORA_FORCE_X11:-0}" = "1" ]; then
+    export GDK_BACKEND=x11
+fi
+exec "$SNAP/bin/ligora" "$@"

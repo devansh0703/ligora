@@ -1,0 +1,18 @@
+#!/bin/bash
+# configure hook: refresh the font cache using the GNOME runtime's
+# fontconfig when the gnome-core26 content snap is connected. The hook
+# must never fail the install, so every step is best-effort.
+set -u
+
+RUNTIME="${SNAP}/gnome-platform"
+
+if [ -x "${RUNTIME}/usr/bin/fc-cache" ]; then
+    export SNAP_DESKTOP_RUNTIME="${RUNTIME}"
+    export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${HOME}/.cache}"
+    export XDG_DATA_DIRS="${RUNTIME}/usr/share:${XDG_DATA_DIRS:-/usr/share}"
+    export FONTCONFIG_PATH="${RUNTIME}/etc/fonts:${FONTCONFIG_PATH:-}"
+    "${RUNTIME}/usr/bin/fc-cache" --force --system-only 2>/dev/null \
+        || echo "configure hook: font cache generation skipped"
+fi
+
+exit 0

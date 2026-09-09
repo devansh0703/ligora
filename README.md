@@ -79,23 +79,50 @@ Full rules are in `RULES.md`.
 
 ## Installation
 
-### From Snap (recommended for Ubuntu/Debian)
+### From Snap (recommended for Ubuntu 24.04+ / any snapd desktop)
+
+Ligora ships as a **strictly-confined snap on the `core26` base** — every engine,
+Python dependency, and the GNOME runtime bits are inside the snap or its content
+snaps, so there is nothing else to install:
 
 ```bash
-# Install from Snap Store (when available)
+# From the Snap Store (public release)
 sudo snap install ligora
 
-# Or build from source
-cd snap
-snapcraft
-sudo snap install ligora_*.snap --dangerous
+# Connect the desktop runtime content snap (first run)
+sudo snap connect ligora:gnome-core26 gnome-core26
 ```
+
+What the snap contains and how it is wired:
+
+| Component | Details |
+|---|---|
+| App | Tauri 2 (Rust bridge + vite/3Dmol.js frontend) at `$SNAP/bin/ligora` |
+| Backend | Full Python package at `$SNAP/usr/lib/ligora-backend`, run by the base's Python 3.14 |
+| Engines bundled | AutoDock Vina, PLIP (`plipcmd`), Open Babel, GROMACS, DSSP, RDKit — from Ubuntu repositories, staged into the snap |
+| Python deps | numpy, scipy, requests, rdkit, lxml — all distro-built, no PyPI wheels bundled |
+| Desktop runtime | `gnome-core26` content snap (WebKitGTK 4.1, themes, fonts) via the `gnome-core26` plug |
+| GPU | `mesa-2604` content snap via the `gpu-2604` interface (upstream gpu-snap wrapper) |
+| Data dir | `~/snap/ligora/common` (workspaces, caches, logs) |
+| Networking | Only to public open-data APIs: RCSB, PubChem, ChEMBL, UniChem, BindingDB, EBI |
+
+Build it yourself from source:
+
+```bash
+snapcraft pack --destructive-mode   # or plain `snapcraft` to build in LXD
+sudo snap install ligora_*.snap --dangerous
+sudo snap connect ligora:gnome-core26 gnome-core26
+```
+
+The snap packages real engines from the Ubuntu archive; fpocket is not in the
+archive, so pocket detection reports it as unavailable rather than faking
+results (see `RULES.md`).
 
 ### From Source
 
 ```bash
 # Clone the repository
-git clone https://github.com/ligora/ligora.git
+git clone https://github.com/devansh0703/ligora.git
 cd ligora
 
 # Install Python backend dependencies
@@ -158,19 +185,25 @@ Ligora enriches analysis with live data from:
 
 ### Snap (x86_64)
 
-The snap package includes:
-- Tauri frontend (Rust + Web)
-- Python backend with all dependencies
-- Pre-installed engines (Vina, PLIP)
-- Access to user's home directory and network
+The snap is declared in `snap/snapcraft.yaml`:
 
 ```yaml
-# snap/snapcraft.yaml
 name: ligora
 version: '0.1.0'
-base: core22
+base: core26
 confinement: strict
+license: MIT
 ```
+
+It includes:
+- Tauri frontend (Rust + Web) built with the real toolchain
+- Python backend package + distro-built dependencies
+- Engines staged from Ubuntu packages (Vina, PLIP, Open Babel, GROMACS, DSSP, RDKit)
+- GNOME desktop runtime and GPU driver integration via content snaps
+- `configure` hook (font cache), command-chain launchers, desktop entry
+
+Plugs: `desktop`, `x11`, `wayland`, `opengl`, `network`, `home`, `gsettings`,
+plus content plugs `gnome-core26`, `gpu-2604`, and `gtk-common-themes`.
 
 ### Building
 
@@ -253,12 +286,14 @@ Components used by Ligora have their own licenses:
 
 - **AutoDock Vina**: Apache 2.0
 - **PLIP**: GPL v2
+- **GROMACS**: LGPL v2.1
+- **Open Babel**: GPL v2
+- **DSSP**: Apache 2.0
+- **RDKit**: BSD-3-Clause
 - **gnina**: GPL v2 / Apache 2.0 (dual)
 - **OpenMM**: LGPL
 - **PySCF**: Apache 2.0
 - **3Dmol.js**: BSD-3-Clause
-
-See the THIRD_PARTY_LICENSES file for details.
 
 ## Contributing
 

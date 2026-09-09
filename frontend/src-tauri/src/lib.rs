@@ -89,11 +89,16 @@ impl BackendState {
 }
 
 fn find_backend_script() -> Option<std::path::PathBuf> {
-    // Explicit override for packaged/snap deployments.
+    // Explicit override for packaged/snap deployments. Accepts either the
+    // package's parent directory (LIGORA_BACKEND_DIR=<...>/usr/lib/ligora-backend)
+    // or the package directory itself.
     if let Ok(dir) = std::env::var("LIGORA_BACKEND_DIR") {
-        let p = std::path::PathBuf::from(dir).join("server.py");
-        if p.exists() {
-            return Some(p);
+        let d = std::path::PathBuf::from(dir);
+        if d.join("ligora_backend").join("server.py").exists() {
+            return Some(d);
+        }
+        if d.join("server.py").exists() {
+            return Some(d);
         }
     }
     // Dev fallbacks: run straight from the repository checkout.
@@ -113,10 +118,21 @@ fn find_backend_script() -> Option<std::path::PathBuf> {
 }
 
 fn start_backend(app: AppHandle) -> Result<BackendState, String> {
-    let module_dir =
+    let package_dir =
         find_backend_script().ok_or_else(|| {
             "Python backend (ligora_backend/server.py) not found".to_string()
         })?;
+    // `python -m ligora_backend.server` needs the package's PARENT on
+    // sys.path; when the discovered directory is the package itself (dev
+    // checkout), switch to its parent.
+    let module_dir = if package_dir.join("__init__.py").exists() {
+        package_dir
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or(package_dir)
+    } else {
+        package_dir
+    };
 
     let python =
         std::env::var("LIGORA_PYTHON").unwrap_or_else(|_| "python3".into());

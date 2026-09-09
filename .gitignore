@@ -28,3 +28,18 @@ frontend/node_modules/.vite/
 # Tauri/Rust build artifacts
 frontend/src-tauri/target/
 frontend/src-tauri/gen/
+
+# GROMACS artifacts
+*.gro
+*.top
+*.itp
+#*#
+
+# snapcraft work dirs & output
+/parts/
+/prime/
+/stage/
+*.snap
+
+# editor backup junk
+backend/#*#

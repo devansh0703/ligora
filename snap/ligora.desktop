@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Ligora
+GenericName=Molecular Analysis Workstation
+Comment=Protein-ligand interaction analysis, docking, and computational chemistry workflows
+Exec=ligora
+Icon=${SNAP}/usr/share/icons/hicolor/128x128/apps/ligora.png
+Terminal=false
+Categories=Science;Chemistry;Biology;
+Keywords=molecule;protein;ligand;docking;chemistry;pdb;
+StartupWMClass=ligora

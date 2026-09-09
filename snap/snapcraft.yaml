@@ -1,5 +1,6 @@
 name: ligora
 version: '0.1.0'
+title: Ligora
 summary: Molecular analysis workstation
 description: |
   Ligora is a molecular analysis workstation for protein-ligand interaction
@@ -19,146 +20,248 @@ description: |
 
 grade: stable
 confinement: strict
-base: core22
-
-architectures:
-  - amd64
+base: core26
+assumes: [snapd2.43]
+license: MIT
+website: https://github.com/devansh0703/ligora
+contact: devansh2020raulo@gmail.com
+issues: https://github.com/devansh0703/ligora/issues
+source-code: https://github.com/devansh0703/ligora
+platforms:
+  amd64:
+    build-on: [amd64]
+    build-for: [amd64]
 
 apps:
   ligora:
+    # GPU wrapper first (mounts the mesa-2604 driver stack), then the
+    # desktop launcher (delegates to gnome-core26's own launcher, which
+    # performs the full GNOME environment setup and execs the wrapper).
+    command-chain:
+      - bin/gpu-2604-wrapper
+      - snap/command-chain/desktop-launch
     command: bin/ligora-wrapper
-    extensions: [gnome]
+    desktop: ligora.desktop
     environment:
       LIGORA_BASE_DIR: $SNAP_USER_COMMON
       # Python backend package shipped inside the snap.
       LIGORA_BACKEND_DIR: $SNAP/usr/lib/ligora-backend
-      # python3 from the core22 base.
+      # python3 from the core26 base (3.14).
       LIGORA_PYTHON: $SNAP/usr/bin/python3
-      # Engine executables staged from real distro packages below.
-      PATH: $SNAP/usr/bin:$SNAP/bin:$PATH
-      PLIP_PATH: $SNAP/usr/bin/plip
+      # Real engines staged from distro packages below.
+      PATH: $SNAP/usr/sbin:$SNAP/usr/bin:$SNAP/sbin:$SNAP/bin:$PATH
+      # GROMACS data files (share/gromacs) live under $SNAP; gmx honours
+      # GMXDATA for its own data lookup.
+      GMXDATA: $SNAP/usr/share/gromacs
     plugs:
       - desktop
-      - x11
-      - wayland
+      - desktop-legacy
+      - gsettings
       - opengl
+      - wayland
+      - x11
       - home
       - network
 
+# The `gnome` extension does not support core26 yet, so the GNOME runtime
+# integration is wired manually here against the gnome-core26 content snap
+# (provider of the gnome-platform content):
+# - the content plug below mounts the runtime at $SNAP/gnome-platform
+# - $SNAP_DESKTOP_RUNTIME points the platform's own launcher at it
+# - snap/command-chain/* forwarders delegate to the launcher shipped
+#   inside gnome-core26 (snap/command-chain/desktop-launch there performs
+#   the full XDG/GL/theme/mime setup and execs the app command)
+# - layouts expose the runtime's webkit2gtk/libproxy/iso-codes trees at
+#   the absolute paths WebKit expects
+environment:
+  SNAP_DESKTOP_RUNTIME: $SNAP/gnome-platform
+  GTK_USE_PORTAL: '1'
+
+hooks:
+  configure:
+    plugs:
+      - desktop
+
+layout:
+  /usr/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR/webkit2gtk-4.1:
+    bind: $SNAP/gnome-platform/usr/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR/webkit2gtk-4.1
+  /usr/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR/libproxy:
+    bind: $SNAP/gnome-platform/usr/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR/libproxy
+  /usr/share/xml/iso-codes:
+    bind: $SNAP/gnome-platform/usr/share/xml/iso-codes
+  # gdk-pixbuf on 26.04 delegates image decoding to glycin external
+  # loaders, spawned at absolute paths that must exist inside the snap
+  # namespace (binaries + their loader configs).
+  /usr/libexec/glycin-loaders:
+    bind: $SNAP/gnome-platform/usr/libexec/glycin-loaders
+  /usr/share/glycin-loaders:
+    bind: $SNAP/gnome-platform/usr/share/glycin-loaders
+
+plugs:
+  gnome-core26:
+    interface: content
+    target: $SNAP/gnome-platform
+    default-provider: gnome-core26
+  gpu-2604:
+    interface: content
+    target: $SNAP/gpu-2604
+    default-provider: mesa-2604
+  desktop:
+    mount-host-font-cache: false
+  gtk-3-themes:
+    interface: content
+    target: $SNAP/data-dir/themes
+    default-provider: gtk-common-themes
+  icon-themes:
+    interface: content
+    target: $SNAP/data-dir/icons
+    default-provider: gtk-common-themes
+  sound-themes:
+    interface: content
+    target: $SNAP/data-dir/sounds
+    default-provider: gtk-common-themes
+
 parts:
+  # Python backend: shipped as a plain package tree. Every dependency
+  # (numpy, scipy, requests, rdkit) comes from core26's own distro
+  # packages (staged in `engines`), so nothing is compiled by pip and no
+  # wheel is bundled from outside the distro.
   ligora-backend:
-    plugin: python
-    source: ../backend
-    python-requirements: [requirements.txt]
-    build-packages:
-      - python3-dev
-      - libjpeg-dev
-      - zlib1g-dev
-      - libfreetype6-dev
-      - libpng-dev
-    override-pull: |
-      craftctl default
-      # Keep the python plugin's site-packages layout predictable.
-      craftctl set env "PIP_NO_WARN_SCRIPT_LOCATION=1"
+    plugin: dump
+    source: backend
+    organize:
+      ligora_backend: usr/lib/ligora-backend/ligora_backend
     override-build: |
       craftctl default
-      # Expose the package where the wrapper and Rust bridge expect it.
-      mkdir -p "$SNAPCRAFT_PART_INSTALL/usr/lib/ligora-backend"
-      site="$SNAPCRAFT_PART_INSTALL/lib/python3.10/site-packages"
-      if [ -d "$site/ligora_backend" ]; then
-        cp -r "$site/ligora_backend" \
-          "$SNAPCRAFT_PART_INSTALL/usr/lib/ligora-backend/"
-      fi
+      # Working files from local GROMACS runs / editor backups are never
+      # shippable payload.
+      rm -rf "${CRAFT_PART_INSTALL}"/tests \
+             "${CRAFT_PART_INSTALL}"/.venv \
+             "${CRAFT_PART_INSTALL}"/.pytest_cache \
+             "${CRAFT_PART_INSTALL}"/.ruff_cache \
+             "${CRAFT_PART_INSTALL}"//'#'* \
+             "${CRAFT_PART_INSTALL}"/topol.top \
+             "${CRAFT_PART_INSTALL}"/processed.gro \
+             "${CRAFT_PART_INSTALL}"/posre.itp \
+             "${CRAFT_PART_INSTALL}"/run_app_flow.py \
+             "${CRAFT_PART_INSTALL}"/requirements.txt
+      find "${CRAFT_PART_INSTALL}" -type d -name __pycache__ -prune -exec rm -rf {} +
 
+  # The Tauri app: vite frontend + Rust IPC bridge built with the real
+  # toolchain. The binary lands in $SNAP/bin/ligora.
   ligora-app:
     plugin: nil
-    source: ../frontend
-    build-snaps: [node/20/stable]
+    source: frontend
     build-packages:
+      - build-essential
       - curl
+      - file
       - libssl-dev
       - libgtk-3-dev
       - libwebkit2gtk-4.1-dev
       - libayatana-appindicator3-dev
       - librsvg2-dev
       - patchelf
+      - pkg-config
     override-build: |
       set -x
-      cd "$SNAPCRAFT_PART_SRC"
+      cd "$CRAFT_PART_SRC"
       npm install
-      # Build the Tauri app (frontend + Rust bridge) without bundling debs.
-      npx tauri build --no-bundle
-      mkdir -p "$SNAPCRAFT_PART_INSTALL/bin"
-      cp src-tauri/target/release/ligora "$SNAPCRAFT_PART_INSTALL/bin/ligora"
+      # The deb/appimage targets bundle the backend as a Tauri resource;
+      # in the snap the backend ships as its own part under
+      # $SNAP/usr/lib/ligora-backend, so the resource glob (which points
+      # outside the part source) must be emptied via a config overlay.
+      cat > tauri-snap-overlay.json <<'JSON'
+      {"bundle": {"resources": []}}
+      JSON
+      # Builds the vite frontend (beforeBuildCommand) and the Rust bridge;
+      # no distro bundle is produced (the snap is the bundle).
+      npx tauri build --no-bundle --config tauri-snap-overlay.json
+      mkdir -p "$CRAFT_PART_INSTALL/bin"
+      cp src-tauri/target/release/ligora "$CRAFT_PART_INSTALL/bin/ligora"
+      # Desktop integration assets.
+      install -D -m644 src-tauri/icons/128x128.png \
+        "$CRAFT_PART_INSTALL/usr/share/icons/hicolor/128x128/apps/ligora.png"
+      install -D -m644 src-tauri/icons/128x128@2x.png \
+        "$CRAFT_PART_INSTALL/usr/share/icons/hicolor/256x256/apps/ligora.png"
 
+  # Real analysis engines and the Python runtime they and the backend
+  # share, all from the distro. When a tool is absent at runtime the
+  # backend reports it as unavailable; results are never simulated.
   engines:
     plugin: nil
+    override-build: |
+      # Debian ships libblas/liblapack in blas//lapack/ alternatives
+      # subdirs; update-alternatives never runs inside a snap, so create
+      # the conventional links in /usr/lib manually.
+      mkdir -p "${CRAFT_PART_INSTALL}/usr/lib"
+      ln -sf x86_64-linux-gnu/blas/libblas.so.3 \
+        "${CRAFT_PART_INSTALL}/usr/lib/libblas.so.3"
+      ln -sf x86_64-linux-gnu/lapack/liblapack.so.3 \
+        "${CRAFT_PART_INSTALL}/usr/lib/liblapack.so.3"
     stage-packages:
-      # Real analysis engines from the distro - the backend detects and
-      # uses them; when absent it reports unavailability, never fakes.
+      # Python 3.14 runtime for the backend (backend package is plain
+      # source; its sys.path covers $SNAP/usr/lib/python3/dist-packages).
+      - python3
+      - python3-minimal
+      - libpython3.14-stdlib
+      - libpython3.14-minimal
+      # Backend dependencies, compiled for this exact interpreter.
+      - python3-numpy
+      - python3-scipy
+      - python3-requests
+      - python3-rdkit
+      # Engines and preparation tools.
       - autodock-vina
       - plip
       - openbabel
-      # MD minimization / short-MD snippets (gmx; user-configurable via
-      # LIGORA_GMX_PATH, discovered on PATH by default).
       - gromacs
-      # Secondary-structure assignment (provides mkdssp).
       - dssp
-      # fpocket is NOT in Ubuntu repositories: it needs an upstream build
-      # (e.g. a staged part from source or the fpocket snap). Until then
-      # the pockets feature reports fpocket as unavailable - honestly.
-      # Runtime libraries the engines and GUI need.
-      - libxml2
+      # fpocket is NOT in Ubuntu repositories; the pockets feature reports
+      # it as unavailable unless the user provides it (LIGORA_* override).
+      # Engine runtime libraries.
+      - libboost-program-options1.90.0
+      - libboost-serialization1.90.0
+      - libboost-iostreams1.90.0
+      - libxml2-16
       - zlib1g
-      - libboost-program-options1.74
-      - libboost-serialization1.74
-      - libboost-system1.74
-      - libboost-graph1.74
-      # Python runtime for the backend process (base core22 provides it,
-      # listed explicitly so the wrapper's interpreter is guaranteed).
-      - python3
-      - python3-minimal
-      - libpython3.10-stdlib
-      - libpython3.10-minimal
-      # 3D rendering stack used by the webview and WebGL viewer.
-      - libgl1
-      - libegl1
-      - libnss3
-      - libxss1
-      - libgbm1
-      - libasound2
-      - libatk-bridge2.0-0
-      - libatk1.0-0
-      - libcups2
-      - libxkbcommon0
-      - libatspi2.0-0
-      - libdrm2
-      - libxcomposite1
-      - libxdamage1
-      - libxfixes3
-      - libxrandr2
-      - libpango-1.0-0
-      - libcairo2
-      - libgdk-pixbuf-2.0-0
+      # PLIP script dependencies beyond the backend's own.
+      - python3-openbabel
+      - python3-lxml
 
-  wrappers:
+  # Command-chain forwarders + launcher + desktop file. The three
+  # chain scripts are exactly the core24 gnome extension's consumer-side
+  # templates (they only reference $SNAP paths); the gpu wrapper is the
+  # gpu-snap template with %GPU_INTERFACE% substituted.
+  ligora-runtime:
     plugin: dump
-    source: .
-    override-build: |
-      set -x
-      mkdir -p "$SNAPCRAFT_PART_INSTALL/bin"
-      cat > "$SNAPCRAFT_PART_INSTALL/bin/ligora-wrapper" <<'EOF'
-      #!/bin/bash
-      # Ligora snap launcher: wires the real engine paths and starts the
-      # Tauri app, which spawns the Python backend via LIGORA_* variables.
-      export LIGORA_BASE_DIR="${LIGORA_BASE_DIR:-$SNAP_USER_COMMON}"
-      export LIGORA_BACKEND_DIR="$SNAP/usr/lib/ligora-backend"
-      export LIGORA_PYTHON="$SNAP/usr/bin/python3"
-      export PATH="$SNAP/usr/bin:$SNAP/bin:$PATH"
-      export PLIP_PATH="$SNAP/usr/bin/plip"
-      # Open Babel needs its own share dir for format plugins.
-      export BABEL_DATADIR="$SNAP/usr/share/openbabel"
-      export LD_LIBRARY_PATH="$SNAP/usr/lib/$SNAPCRAFT_ARCH_TRIPLET:$LD_LIBRARY_PATH"
-      exec "$SNAP/bin/ligora" "$@"
-      EOF
-      chmod +x "$SNAPCRAFT_PART_INSTALL/bin/ligora-wrapper"
+    source: snap
+    organize:
+      ligora-wrapper: bin/ligora-wrapper
+      command-chain: snap/command-chain
+      hooks: snap/hooks
+    stage:
+      - snap/command-chain/desktop-launch
+      - snap/command-chain/run
+      - snap/hooks/configure
+      - bin/ligora-wrapper
+      - ligora.desktop
+    prime:
+      - snap/command-chain/desktop-launch
+      - snap/command-chain/run
+      - snap/hooks/configure
+      - bin/ligora-wrapper
+      - ligora.desktop
+
+  # GPU integration per the upstream gpu-snap recipe: the part clones
+  # gpu-snap, primes its maintained wrapper, and trims the mesa-2604
+  # driver payload from the prime dir (must run after all other parts).
+  gpu-2604:
+    after: [ligora-backend, ligora-app, engines, ligora-runtime]
+    source: https://github.com/canonical/gpu-snap.git
+    plugin: dump
+    override-prime: |
+      craftctl default
+      "${CRAFT_PART_SRC}"/bin/gpu-2604-cleanup mesa-2604
+    prime:
+      - bin/gpu-2604-wrapper
