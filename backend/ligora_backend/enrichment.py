@@ -382,13 +382,14 @@ class EnrichmentClient:
             ))
 
         if ligand.get('classification_hint'):
+            ligand_id = (ligand.get('residue_name', '')
+                         or ligand.get('name', ''))
             evidence_items.append(EvidenceItem(
                 source='rcsb_ccd',
                 field='component_classification',
                 value={'pdbx_type': ligand['classification_hint']},
                 url=("https://www.rcsb.org/ligands/"
-                     f"{quote(ligand.get('residue_name', '')
-                             or ligand.get('name', ''))}"),
+                     f"{quote(ligand_id)}"),
             ))
 
         return evidence_items
