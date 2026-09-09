@@ -98,5 +98,14 @@ jobs:
 
       - name: Build snap (destructive mode, no LXD)
         run: |
+          . /etc/os-release
+          # The core26 base requires a 26.04 host for destructive-mode
+          # builds (binary compatibility guarantee). GitHub's ubuntu-latest
+          # runners are 24.04, which cannot build it; make that an explicit,
+          # versioned skip rather than an opaque failure.
+          if [ "$VERSION_ID" != "26.04" ]; then
+            echo "Skipping snap build: core26 needs Ubuntu 26.04 host, runner is $VERSION_ID"
+            exit 0
+          fi
           cd snap
           snapcraft pack --destructive-mode
