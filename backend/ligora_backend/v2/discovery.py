@@ -382,9 +382,21 @@ class DiscoveryClient:
         if label_comp_id:
             params["label_comp_id"] = label_comp_id.strip().upper()
         url = f"{self.MODEL_SERVER_URL}/{pdb_id}/atoms"
-        resp = self._session.get(
-            url, params=params,
-            timeout=http_timeout(self.config.request_timeout))
+        # ModelServer computes the subset on demand and can be slow or
+        # transiently 5xx under load, so give it the same honest one-retry
+        # other RCSB compute endpoints get (search.rcsb.org).
+        resp = None
+        for attempt in range(2):
+            try:
+                resp = self._session.get(
+                    url, params=params,
+                    timeout=http_timeout(self.config.request_timeout))
+                if resp.status_code in (500, 502, 503, 504) and attempt == 0:
+                    continue
+                break
+            except requests.RequestException as e:
+                if attempt == 1:
+                    raise DiscoveryError(f"ModelServer unreachable: {e}") from e
         if resp.status_code == 400:
             raise DiscoveryError(
                 f"ModelServer rejected the subset request ({resp.text[:160]})")
