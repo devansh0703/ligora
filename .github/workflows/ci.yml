@@ -96,7 +96,7 @@ jobs:
         run: |
           sudo snap install snapcraft --classic
 
-      - name: Build snap
+      - name: Build snap (destructive mode, no LXD)
         run: |
           cd snap
-          snapcraft
+          snapcraft pack --destructive-mode
