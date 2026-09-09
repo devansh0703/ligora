@@ -56,17 +56,18 @@ class DiscoveryClient:
         # profile can exceed the lookup timeout. A longer total deadline is
         # applied per service — still a hard cap, still no fabrication.
         budget = timeout_seconds or self.config.request_timeout
-        # One honest retry on transient 500s (RCSB's compute services poll
+        # One honest retry on transient 5xx (RCSB's compute services poll
         # their internal workers on a ~30 s ticket and can return 500 under
-        # load with a correct query). Same payload, no parameter changes.
+        # load with a correct query, and the search API can answer 503 while
+        # a backend is warming). Same payload, no parameter changes.
         resp = None
         for attempt in range(2):
             try:
                 resp = self._session.post(self.SEARCH_URL, json=payload,
                                           timeout=http_timeout(budget))
-                # A 500 from the compute backend is transient when the query
+                # A 5xx from the compute backend is transient when the query
                 # itself validated; retry once before reporting failure.
-                if resp.status_code == 500 and attempt == 0:
+                if resp.status_code in (500, 502, 503, 504) and attempt == 0:
                     continue
                 break
             except requests.RequestException as e:
