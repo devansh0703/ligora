@@ -2362,7 +2362,16 @@ export function createApp({ sendCommand }) {
   }
 
   async function start() {
-    initViewer()
+    // The 3D viewer must never take the whole workstation down: if WebGL is
+    // unavailable (or the GPU context fails), everything else — PDB loading,
+    // contact analysis, docking, V2 panels — still works on real data.
+    try {
+      initViewer()
+    } catch (err) {
+      viewer = null
+      console.error('3D viewer unavailable:', err)
+      showStatus(`3D viewer unavailable (${err && err.message ? err.message : err}); analysis panels still work`, true)
+    }
 
     el('btn-open-file')?.addEventListener('click', openLocalFile)
     el('btn-open-pdb')?.addEventListener('click', openPdbId)

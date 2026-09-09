@@ -13,6 +13,27 @@
 import { invoke } from '@tauri-apps/api/core'
 import { createApp } from './app'
 
+// WebKitGTK (Tauri on Linux) exposes the OffscreenCanvas constructor but its
+// WebGL contexts return null, while 3Dmol.js assumes OSC WebGL support when
+// the global exists and binds the null context — killing the whole viewer.
+// Probing real OSC WebGL support up front keeps 3Dmol on the regular-canvas
+// path (which works everywhere). See snap/smoke-test.py GUI verification.
+(function ensureOffscreenCanvasWebGL() {
+  if (typeof OffscreenCanvas === 'undefined') return
+  try {
+    const probe = new OffscreenCanvas(4, 4)
+    if (probe.getContext('webgl2') || probe.getContext('webgl')) return
+  } catch {
+    // fall through to the shim
+  }
+  try {
+    // @ts-ignore - deliberate: hide the broken global from feature detection
+    window.OffscreenCanvas = undefined
+  } catch {
+    // Non-configurable global: nothing more we can do here.
+  }
+})()
+
 // Session state shared by all commands.
 const sessionState = { id: null }
 
