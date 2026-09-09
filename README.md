@@ -27,6 +27,10 @@ Real captures from the packaged app driving **live data** — see [`screenshots/
 
 </details>
 
+## Snap Store
+
+<iframe src="https://snapcraft.io/ligora/embedded?button=black&channels=true&summary=true" frameborder="0" width="100%" height="450px" style="border: 1px solid #CCC; border-radius: 2px;"></iframe>
+
 ## Features
 
 ### V1 (Core)
