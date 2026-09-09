@@ -275,7 +275,13 @@ class EnrichmentClient:
                 url, timeout=http_timeout(config.request_timeout))
             if response.status_code != 200:
                 return None
-            molecule = (response.json().get('molecule') or {})
+            data = response.json()
+            # The molecule is the top-level object when fetched by ID; the
+            # list endpoints wrap records in a 'molecule' key instead.
+            molecule = (data.get('molecule')
+                        if isinstance(data, dict) and 'molecule' in data
+                        else data)
+            molecule = molecule or {}
             props = (molecule.get('molecule_properties') or {})
             structs = (molecule.get('molecule_structures') or {})
             return {
