@@ -4,6 +4,29 @@
 
 Ligora is an open-source desktop application for protein-ligand interaction analysis, molecular docking, and computational chemistry workflows. It combines a 3D molecular viewer with analysis tools and integration with external open-source engines.
 
+## Screenshots
+
+Real captures from the packaged app driving **live data** — see [`screenshots/`](screenshots/) for the full set and [`screenshots/README.md`](screenshots/README.md) for details.
+
+| | |
+|---|---|
+| **3W85 loaded from RCSB, rendered in 3D** | **PLIP contact analysis — hydrogen bonds with real distances** |
+| ![3W85 structure loaded](screenshots/02-structure-3w85-loaded.png) | ![PLIP contacts](screenshots/03-contacts-plip-3w85.png) |
+| **PDB-wide live search** | **Real AutoDock Vina docking run — 5 poses with affinities** |
+| ![PDB search](screenshots/05-search-myoglobin.png) | ![Vina docking results](screenshots/07-docking-results-3w85.png) |
+
+<details>
+<summary>More screenshots</summary>
+
+| | |
+|---|---|
+| **App on first launch** | **Evidence pane — live RCSB/PubChem/UniChem provenance** |
+| ![App start](screenshots/01-app-start.png) | ![Evidence pane](screenshots/04-evidence-pane-3w85.png) |
+| **Docking panel — box controls, exhaustiveness, MD** | |
+| ![Docking panel](screenshots/06-docking-panel-3w85.png) | |
+
+</details>
+
 ## Features
 
 ### V1 (Core)
