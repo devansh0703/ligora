@@ -254,6 +254,10 @@ class EnrichmentClient:
             try:
                 resp = self._session.get(
                     url, timeout=http_timeout(config.request_timeout))
+                # Transient 5xx (EBI under load) gets one retry, same policy
+                # as the status checks; a real non-200 answer is final.
+                if resp.status_code in (500, 502, 503, 504) and attempt == 0:
+                    continue
                 if resp.status_code != 200:
                     return None
                 mappings = resp.json()
@@ -279,11 +283,17 @@ class EnrichmentClient:
                     url, timeout=http_timeout(config.request_timeout))
                 if response.status_code == 200:
                     break
+                # EBI answers 502/503/504 under load; retry once rather than
+                # turning a busy moment into a wrong 'no record' answer.
+                if response.status_code in (500, 502, 503, 504):
+                    response = None
+                    continue
+                return None
             except requests.RequestException:
                 continue
         else:
             return None
-        if response.status_code != 200:
+        if response is None or response.status_code != 200:
             return None
         try:
             data = response.json()
@@ -452,6 +462,11 @@ class EnrichmentClient:
                     if ok(response):
                         sources[name] = 'ok'
                         break
+                    # A transient 5xx (EBI/RCSB under load) is retried once
+                    # before being labelled an error.
+                    if response.status_code in (500, 502, 503, 504) \
+                            and _attempt == 0:
+                        continue
                     sources[name] = 'error'
                     break
                 except requests.RequestException:
